@@ -24,35 +24,44 @@ flowchart TD
         WoWClient["WoW Client 3.3.5a (Build 12340)"]
         Browser["Web Browser (BlizzCMS :8080 / Armory :48733)"]
         NAS["Network Storage (NAS / SMB Share)"]
-        DockerDesktop["Docker Desktop (WSL 2 Engine)"]
+        OllamaLocal["Local Ollama AI (RTX 4080 :11434)"]
     end
 
     subgraph WSL2 ["WSL 2 (Ubuntu Filesystem)"]
-        Repo["Core Source (trickerer/AzerothCore-wotlk-with-NPCBots)"]
-        Modules["Modules: mod-autobalance, mod-ah-bot"]
+        Repo["Core Source (AzerothCore + NPCBots)"]
+        Modules["Modules: mod-autobalance, mod-ah-bot, mod-llm-chatter"]
         WebApps["Web Apps: BlizzCMS, AzerothCore Armory"]
         BackupScript["scripts/backup.sh (Daily Cron)"]
     end
 
     subgraph Containers ["Docker Container Stack"]
         AuthServer["ac-authserver (:3724)"]
-        WorldServer["ac-worldserver (:8085, SOAP :7878) [NPCBots + AutoBalance + AHBot]"]
+        WorldServer["ac-worldserver (:8085, SOAP :7878) - NPCBots, AutoBalance, AHBot"]
         DB["ac-database (MySQL 8.4 :3306)"]
         ClientData["ac-client-data-init (DBC, Maps, VMaps, MMaps)"]
         WebPortal["ac-web-portal (BlizzCMS :8080)"]
         Armory["ac-armory (AzerothCore Armory :48733)"]
+        LLMBridge["ac-llm-chatter-bridge (Dynamic Chat, Memory, Item Lookups)"]
+    end
+
+    subgraph CloudAI ["Cloud AI (Optional Free Tier)"]
+        GeminiCloud["Google Gemini API (Dual-Account Pool & Cascade)"]
     end
 
     WoWClient -->|Logon / Realmlist 127.0.0.1| AuthServer
-    WoWClient -->|World Traffic| WorldServer
+    WoWClient -->|World Traffic :8085| WorldServer
     Browser -->|HTTP :8080| WebPortal
     Browser -->|HTTP :48733| Armory
     WebPortal -->|SOAP :7878 (Account Creation)| WorldServer
-    WebPortal -->|Query Auth & CMS Data| DB
-    Armory -->|Query Characters & World| DB
-    WorldServer <--> DB
-    AuthServer <--> DB
-    WorldServer <--> ClientData
+    WebPortal -->|Query Auth and CMS Data| DB
+    Armory -->|Query Characters and World| DB
+    WorldServer --- DB
+    AuthServer --- DB
+    WorldServer --- ClientData
+    WorldServer -->|Chat Events| LLMBridge
+    LLMBridge -->|1st Choice: Cloud| GeminiCloud
+    LLMBridge -->|Automatic Failover: Local| OllamaLocal
+    LLMBridge -->|Query item_template| DB
     BackupScript -->|Hot-dump mysqldump| DB
     BackupScript -->|Stream compressed archives| NAS
 ```

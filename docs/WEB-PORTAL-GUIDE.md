@@ -32,8 +32,8 @@ flowchart TD
     WebPortal -->|SOAP :7878 (Account Creation)| WorldServer
     WebPortal -->|Read/Write blizzcms & acore_auth| DB
     Armory -->|Query acore_characters, acore_world| DB
-    WorldServer <--> DB
-    AuthServer <--> DB
+    WorldServer --- DB
+    AuthServer --- DB
 ```
 
 ---
