@@ -1,0 +1,13 @@
+# Environment and personal configs
+*.env
+*.local
+*.log
+
+# Backup archives
+*.tar.gz
+*.sql.gz
+*.sql
+
+# OS artifacts
+.DS_Store
+Thumbs.db
