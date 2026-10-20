@@ -1,15 +1,14 @@
 # ==================================================================
-# Manage Playerbot Personalities (JSON & Database Sync)
+# Manage Playerbot Personalities (JSON & World Populator)
 # ==================================================================
 
 param(
     [switch]$List,
     [switch]$Apply,
-    [string]$ConfigPath = "config\bot_personalities.json",
-    [string]$Name,
-    [string]$Tone,
-    [string]$Backstory,
-    [string]$Role
+    [switch]$PopulateWorld,
+    [int]$Count = 100,
+    [switch]$Overwrite,
+    [string]$ConfigPath = "config\bot_personalities.json"
 )
 
 $PSScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -23,11 +22,9 @@ elseif ($Apply) {
     $fullConfig = Join-Path $RepoRoot $ConfigPath
     python $PythonScript --apply $fullConfig
 }
-elseif ($Name) {
-    $params = @("--set", "--name", $Name)
-    if ($Tone) { $params += @("--tone", $Tone) }
-    if ($Backstory) { $params += @("--backstory", $Backstory) }
-    if ($Role) { $params += @("--role", $Role) }
+elseif ($PopulateWorld) {
+    $params = @("--populate-world", $Count)
+    if ($Overwrite) { $params += "--overwrite" }
     python $PythonScript @params
 }
 else {
@@ -39,9 +36,9 @@ else {
     Write-Host "      Lists all configured bot backstories and tones in the database."
     Write-Host ""
     Write-Host "  .\scripts\manage-bot-personalities.ps1 -Apply"
-    Write-Host "      Applies all personalities from config\bot_personalities.json to the database."
+    Write-Host "      Applies curated personalities from config\bot_personalities.json to the database."
     Write-Host ""
-    Write-Host "  .\scripts\manage-bot-personalities.ps1 -Name Pier -Tone 'sarcastic speedrunner' -Backstory 'Needs gold for epic mount.'"
-    Write-Host "      Quickly updates a single bot directly."
+    Write-Host "  .\scripts\manage-bot-personalities.ps1 -PopulateWorld [-Count 150] [-Overwrite]"
+    Write-Host "      Populates the entire server population with diverse, authentic gamer archetypes."
     Write-Host "==================================================================" -ForegroundColor Cyan
 }
