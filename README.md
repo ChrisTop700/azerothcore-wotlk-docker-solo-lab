@@ -1,9 +1,10 @@
-# AzerothCore WotLK (3.3.5a) Docker Solo Lab
+# AzerothCore WotLK (3.3.5a) Playerbot & AI Lab
 
 A turn-key architecture and comprehensive setup guide for running a solo and small-group **World of Warcraft: Wrath of the Lich King (3.3.5a, Build 12340)** private server on **Windows 11/10 using WSL 2 and Docker Desktop**.
 
 Featuring:
-* **Tactical Bot Mercenaries**: Built-in NPCBots for customizable party and raid companions.
+* **Living MMORPG World (Playerbots)**: Full playerbot simulation with autonomous questing, RDF dungeon matchmaking, open-world leveling, and alt-character summoning (`.bot add <alt>`).
+* **Local LLM Dynamic Chatter**: Companion personality, party banter, and whisper conversations powered by local **Ollama** (`hermes3:8b` on RTX 4080) via `mod-llm-chatter`.
 * **Dynamic Scaling**: Automatic creature and boss stat scaling for solo/small groups via `mod-autobalance`.
 * **Living Economy**: Automated Auction House buyer/seller bots via `mod-ah-bot`.
 * **Web Portal & Account Registration**: Self-service registration, announcements, and live realm status via BlizzCMS (`:8080`).
