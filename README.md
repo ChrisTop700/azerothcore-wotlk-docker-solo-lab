@@ -70,7 +70,12 @@ flowchart TD
 │   └── WEB-PORTAL-GUIDE.md           # BlizzCMS web registration, account management & armory guide
 ├── scripts/
 │   ├── backup.sh                     # Non-blocking live database and config backup script
-│   └── restore.sh                    # Disaster recovery and host migration import script
+│   ├── restore.sh                    # Disaster recovery and host migration import script
+│   ├── start-server.ps1              # Starts Docker Desktop, Ollama (0.0.0.0), and core game containers
+│   ├── start-web.ps1                 # Starts BlizzCMS portal (:8080) and Armory (:48733)
+│   ├── start-ollama.ps1              # Starts local Ollama server bound to 0.0.0.0:11434
+│   ├── stop-server.ps1               # Gracefully stops all game + web containers and unloads Ollama
+│   └── stop-ollama.ps1               # Unloads active Ollama models from VRAM and stops background runner
 └── README.md
 ```
 
