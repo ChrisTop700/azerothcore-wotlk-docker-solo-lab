@@ -29,11 +29,11 @@ flowchart TD
     WoWClient -->|Logon :3724| AuthServer
     WoWClient -->|World :8085| WorldServer
 
-    WebPortal -->|SOAP :7878 (Account Creation)| WorldServer
-    WebPortal -->|Read/Write blizzcms & acore_auth| DB
-    Armory -->|Query acore_characters, acore_world| DB
-    WorldServer --- DB
-    AuthServer --- DB
+    WebPortal -->|SOAP: Port 7878 Account Creation| WorldServer
+    WebPortal -->|Read and Write blizzcms and acore_auth| DB
+    Armory -->|Query acore_characters and acore_world| DB
+    WorldServer -->|Read and Write World Data| DB
+    AuthServer -->|Read and Write Account Data| DB
 ```
 
 ---

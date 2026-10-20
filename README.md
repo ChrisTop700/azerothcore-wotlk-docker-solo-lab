@@ -51,20 +51,20 @@ flowchart TD
     end
 
     DockerDesktop -->|Drives| Containers
-    Repo -->|Mount / Build| WorldServer
+    Repo -->|Mount and Build| WorldServer
     Modules -->|Compile Modules| WorldServer
-    WoWClient -->|Logon / Realmlist 127.0.0.1| AuthServer
-    WoWClient -->|World Traffic :8085| WorldServer
-    WoWClient -->|CleanBot Addon Messages & Whispers| WorldServer
-    Browser -->|HTTP :8080| WebPortal
-    Browser -->|HTTP :48733| Armory
-    WebPortal -->|SOAP :7878 (Account Creation)| WorldServer
+    WoWClient -->|Logon: Realmlist 127.0.0.1| AuthServer
+    WoWClient -->|World Traffic: Port 8085| WorldServer
+    WoWClient -->|CleanBot Addon Messages and Whispers| WorldServer
+    Browser -->|HTTP: Port 8080| WebPortal
+    Browser -->|HTTP: Port 48733| Armory
+    WebPortal -->|SOAP: Port 7878 Account Creation| WorldServer
     WebPortal -->|Query Auth and CMS Data| DB
     Armory -->|Query Characters and World| DB
-    WorldServer -->|Read / Write World & Bot State| DB
-    AuthServer -->|Read / Write Account Data| DB
-    WorldServer -->|Load DBC, Maps & MMaps| ClientData
-    WorldServer -->|Chat Events & Banter Triggers| LLMBridge
+    WorldServer -->|Read and Write World and Bot State| DB
+    AuthServer -->|Read and Write Account Data| DB
+    WorldServer -->|Load DBC, Maps and MMaps| ClientData
+    WorldServer -->|Chat Events and Banter Triggers| LLMBridge
     LLMBridge -->|Primary: Cloud AI| GeminiCloud
     LLMBridge -->|Fallback: Local Ollama| OllamaLocal
     LLMBridge -->|Query item_template| DB
