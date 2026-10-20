@@ -6,34 +6,47 @@ This guide details how to connect your AzerothCore Playerbots to the **Google Ge
 
 ## 1. Why Google Gemini Free Tier?
 
-* **100% Free**: Google AI Studio provides **15 requests per minute** and **1,500 requests per day** for models like `gemini-2.5-flash` and `gemini-1.5-flash` at zero cost.
-* **Massive Context & Memory**: Gemini effortlessly handles long backstories, party history, and item stats without hitting token caps.
+* **100% Free**: Google AI Studio provides **15 requests per minute** and **1,500 requests per day** for models like `gemini-2.5-flash`, `gemini-2.0-flash`, and `gemini-2.0-flash-lite` at zero cost.
+* **Per-Model Quota Isolation**: Quotas in Google AI Studio are tracked **independently per model**. Using Flash and Lite models (e.g. `gemini-2.5-flash` or `gemini-2.0-flash-lite`) means your playerbot chatter has its own separate quota and never competes with the models you use for daily work.
+* **Multi-Account Failover Pool**: You can plug in **two separate Google accounts** (Account 1 and Account 2). If Account 1 hits a rate limit, the bridge instantly fails over to Account 2, doubling your free capacity to **30–60 RPM** and **3,000–6,000 RPD**.
+* **Model Cascading**: If your primary model is temporarily saturated, the bridge seamlessly tries the next model in the cascade (`gemini-2.0-flash-lite`), which has its own independent free quota bucket.
 * **Instant In-Game Responses**: With `ThinkingBudget = 0`, Gemini Flash responds in under 400ms—feeling like a real player typing in party or whisper chat.
-* **Separation of Accounts**: Keeps your gaming lab completely isolated from your primary developer or production Google credentials.
+* **Ultimate Local Safety Net**: If all cloud accounts/models are exhausted or internet drops, the server automatically recovers via local **Ollama (`hermes3:8b`)** on your RTX 4080.
 
 ---
 
-## 2. Getting Your Free Gemini API Key (Secondary Account)
+## 2. Getting Free Gemini API Keys (Secondary Accounts)
 
-1. Open an incognito/private browser window or log into your **secondary Google account**.
+1. Open an incognito/private browser window and log into your **secondary Google account(s)**.
 2. Navigate to **Google AI Studio**: [https://aistudio.google.com/app/apikey](https://aistudio.google.com/app/apikey)
 3. Click **"Create API key"** (select "Create API key in new project").
 4. Copy your key (starts with `AIza...`).
+5. *(Optional for 2x Capacity)*: Repeat on a second alternative account to get a secondary key.
 
 ---
 
-## 3. Switching to Gemini Cloud
+## 3. Switching to Gemini Cloud (Single or Dual Account)
 
 Run the automated switcher script from PowerShell:
 
 ```powershell
 .\scripts\setup-gemini-cloud.ps1
 ```
-*(It will prompt for your API key, update the bridge config, restart the Docker container, and verify the live connection).*
+*(It will prompt for Primary Key, optionally for Secondary Key, configure the model cascade, restart the Docker bridge, and verify live connectivity).*
 
-Or pass it directly:
+Or pass both keys directly:
 ```powershell
-.\scripts\setup-gemini-cloud.ps1 -ApiKey "AIzaSy..." -Model "gemini-2.5-flash"
+.\scripts\setup-gemini-cloud.ps1 -ApiKey "AIzaSy_Account1..." -SecondaryApiKey "AIzaSy_Account2..." -Model "gemini-2.5-flash"
+```
+
+### Cascading Flow Diagram:
+```text
+Player Chat Trigger
+  └─► Account 1 (gemini-2.5-flash) [15 RPM]
+        └─► (If 429) Account 2 (gemini-2.5-flash) [15 RPM]
+              └─► (If 429) Account 1 (gemini-2.0-flash-lite) [15 RPM separate quota]
+                    └─► (If 429) Account 2 (gemini-2.0-flash-lite) [15 RPM separate quota]
+                          └─► (If all cloud exhausted) Local Ollama (hermes3:8b on RTX 4080)
 ```
 
 ### Reverting to Local Ollama Anytime

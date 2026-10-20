@@ -1,10 +1,13 @@
 # ==================================================================
 # Setup Google Gemini Free-Tier Cloud for Playerbot Chatter
+# Supports Multi-Account Key Pool & Separate-Quota Model Cascades
 # ==================================================================
 
 param(
     [string]$ApiKey,
+    [string]$SecondaryApiKey,
     [string]$Model = "gemini-2.5-flash",
+    [string]$FallbackModels = "gemini-2.0-flash-lite,gemini-1.5-flash",
     [switch]$SwitchToOllama
 )
 
@@ -44,21 +47,36 @@ with open(conf_file, 'w', encoding='utf-8') as f:
 }
 
 if (-not $ApiKey) {
-    Write-Host "To use Google Gemini Free Tier for Playerbot chatter:" -ForegroundColor Yellow
-    Write-Host " 1. Sign in to your secondary Google account at: https://aistudio.google.com/app/apikey" -ForegroundColor White
-    Write-Host " 2. Click 'Create API key' and copy the generated key (starts with 'AIza...')." -ForegroundColor White
+    Write-Host "Google Gemini Free-Tier Configuration:" -ForegroundColor Yellow
+    Write-Host " * Quotas are per-model and per-account (15 RPM / 1,500 RPD each)." -ForegroundColor Gray
+    Write-Host " * Using secondary Google accounts ensures your main work quota is 100% untouched." -ForegroundColor Gray
     Write-Host ""
-    $ApiKey = Read-Host "Enter your Google Gemini API Key"
+    $ApiKey = Read-Host "Enter Primary Gemini API Key (Account 1)"
 }
 
 if (-not $ApiKey -or $ApiKey.Trim() -eq "") {
-    Write-Host "Error: No API key provided. Operation cancelled." -ForegroundColor Red
+    Write-Host "Error: Primary API key is required. Operation cancelled." -ForegroundColor Red
     exit 1
 }
 
 $ApiKey = $ApiKey.Trim()
 
-Write-Host "`nConfiguring Google Gemini ($Model) in mod_llm_chatter.conf..." -ForegroundColor Cyan
+if (-not $SecondaryApiKey) {
+    $secInput = Read-Host "Enter Secondary Gemini API Key (Account 2) [Optional, press Enter to skip]"
+    if ($secInput -and $secInput.Trim() -ne "") {
+        $SecondaryApiKey = $secInput.Trim()
+    }
+}
+
+$combinedKeys = $ApiKey
+if ($SecondaryApiKey -and $SecondaryApiKey.Trim() -ne "") {
+    $combinedKeys = "$ApiKey,$($SecondaryApiKey.Trim())"
+}
+
+Write-Host "`nConfiguring Google Gemini Cloud Pool..." -ForegroundColor Cyan
+Write-Host " * Primary Model:    $Model" -ForegroundColor White
+Write-Host " * Fallback Models:  $FallbackModels" -ForegroundColor White
+Write-Host " * Account Keys:     $(if ($SecondaryApiKey) { '2 Accounts configured (automatic failover)' } else { '1 Account configured' })" -ForegroundColor White
 
 # Update mod_llm_chatter.conf safely inside WSL
 wsl -d Ubuntu python3 -c @"
@@ -67,6 +85,8 @@ with open(conf_file, 'r', encoding='utf-8') as f:
     lines = f.readlines()
 
 new_lines = []
+has_fallback_models = False
+
 for line in lines:
     stripped = line.strip()
     if stripped.startswith('LLMChatter.Provider'):
@@ -74,19 +94,25 @@ for line in lines:
     elif stripped.startswith('LLMChatter.Model ='):
         new_lines.append('LLMChatter.Model = $Model\n')
     elif stripped.startswith('LLMChatter.Google.ApiKey'):
-        new_lines.append('LLMChatter.Google.ApiKey = $ApiKey\n')
+        new_lines.append('LLMChatter.Google.ApiKey = $combinedKeys\n')
     elif stripped.startswith('LLMChatter.Google.ThinkingBudget'):
         new_lines.append('LLMChatter.Google.ThinkingBudget = 0\n')
     elif stripped.startswith('LLMChatter.Google.ReasoningEffort'):
         new_lines.append('LLMChatter.Google.ReasoningEffort = minimal\n')
+    elif stripped.startswith('LLMChatter.Google.FallbackModels'):
+        new_lines.append('LLMChatter.Google.FallbackModels = $FallbackModels\n')
+        has_fallback_models = True
     else:
         new_lines.append(line)
+
+if not has_fallback_models:
+    new_lines.append('LLMChatter.Google.FallbackModels = $FallbackModels\n')
 
 with open(conf_file, 'w', encoding='utf-8') as f:
     f.writelines(new_lines)
 "@
 
-Write-Host "Configuration saved. Restarting ac-llm-chatter-bridge..." -ForegroundColor Cyan
+Write-Host "`nRestarting ac-llm-chatter-bridge..." -ForegroundColor Cyan
 docker restart ac-llm-chatter-bridge | Out-Null
 
 Write-Host "Waiting for chatter bridge healthcheck..." -ForegroundColor Gray
@@ -96,8 +122,8 @@ Write-Host "`nBridge Live Status:" -ForegroundColor Green
 docker logs --tail 25 ac-llm-chatter-bridge
 
 Write-Host "`n==================================================================" -ForegroundColor Cyan
-Write-Host "   Google Gemini Integration Ready!" -ForegroundColor Green
+Write-Host "   Multi-Account Gemini Integration Ready!" -ForegroundColor Green
 Write-Host "==================================================================" -ForegroundColor Cyan
-Write-Host " * Provider:  Google Gemini Cloud ($Model)" -ForegroundColor White
-Write-Host " * API Key:   Stored in WSL config (/config/mod_llm_chatter.conf)" -ForegroundColor Gray
-Write-Host " * Fallback:  Run .\scripts\setup-gemini-cloud.ps1 -SwitchToOllama to revert anytime." -ForegroundColor Yellow
+Write-Host " * Key Failover:    Account 1 -> Account 2 (automatic)" -ForegroundColor White
+Write-Host " * Model Cascade:   $Model -> $FallbackModels (separate quota pools)" -ForegroundColor White
+Write-Host " * Ultimate Backup: Local Ollama (hermes3:8b on RTX 4080)" -ForegroundColor White
