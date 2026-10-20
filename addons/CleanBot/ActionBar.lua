@@ -1,0 +1,1533 @@
+-- ============================================================
+-- ActionBar.lua  —  small standalone action bar
+--
+-- A tiny, movable bar of bot-command buttons that lives outside the main window.
+-- v1: Summon + a Passive toggle, both mirroring the Manage tab's party/raid
+-- (broadcast) behavior. Shown/hidden via the minimap right-click or a Settings
+-- checkbox (persisted). Edit mode (shift-right-click the minimap, or a Settings
+-- checkbox; SESSION-only) disables the buttons and lets the bar be dragged so it
+-- snaps/anchors to nearby visible frames.
+--
+-- Both commands are plain chat commands, so these are ordinary insecure buttons —
+-- no SecureActionButton/taint concerns; everything works in combat. The bar is
+-- BUILT at PLAYER_LOGIN (not file load) so ElvUI detection + theming have run.
+-- ============================================================
+local NS = CleanBotNS
+
+local BTN   = 32   -- button size
+local PAD   = 6    -- bar inner padding
+local GAP   = 4    -- gap between buttons
+local SNAP_DIST    = 20  -- px: how close an edge must be to a frame to ACQUIRE a snap
+local SNAP_RELEASE = 40  -- px: how far past the snap the bar must move to RELEASE it (hysteresis)
+local SNAP_GAP     = 2   -- px gap left when snapped flush to a frame's edge
+
+-- State (assigned by the build; setters guard on `bar` so they're safe pre-build).
+local bar, overlay, snapHighlight, configFrame
+local barButtons = {}   -- the bar's buttons (enabled slots in order); laid out by CB_LayoutBar
+local slotBtns   = {}   -- slot id → bar button frame (all created once from the registry)
+local pendingRunawayRevert  -- key → { name, prev } captured on Runaway; restored on combat end
+-- Persisted button layout (merged with the registry at load): slot order + per-flyout child order, plus
+-- disabled sets. Built by CB_LoadLayout, consumed by CB_RebuildBar, written by CB_SaveLayout.
+local barLayout = { slotOrder = {}, slotOff = {}, childOrder = {}, childOff = {} }
+
+-- Effective on-screen opacity: the product of the frame's own alpha and all its ancestors'. A frame
+-- can be IsVisible() (shown, in a shown parent chain) yet faded to nothing — ElvUI does this to its
+-- action bars on mouseover-fade — so we treat near-zero effective alpha as "not really shown".
+local function CB_EffectiveAlpha(f)
+    local a = 1
+    while f and f.GetAlpha do
+        a = a * (f:GetAlpha() or 1)
+        if a <= 0.05 then return a end
+        f = f:GetParent()
+    end
+    return a
+end
+
+-- Calls fn(frame, name) for each snap-candidate: a named, visible (shown AND not faded out),
+-- reasonably-sized frame. Two sources: direct children of UIParent / ElvUIParent, plus oUF's spawned
+-- unit frames (ElvUF_Player, target, party/raid, …). The latter are reparented under their movers —
+-- grandchildren of UIParent — so a child scan misses them; oUF tracks them all in ElvUF.objects.
+-- Named so the chosen anchor survives a reload (re-found via _G[name]); size-bounded to skip
+-- full-screen containers; the bar and its own highlight are excluded.
+local function CB_ForEachSnapCandidate(fn)
+    local maxW, maxH = UIParent:GetWidth() * 0.9, UIParent:GetHeight() * 0.9
+    local seen = {}
+    local function tryFrame(f)
+        if not f or seen[f] then return end
+        local name = f.GetName and f:GetName()
+        -- Skip tooltips: they're transient, and GameTooltip is anchored to the bar while its edit
+        -- tooltip shows (SetOwner), so snapping TO it would be a dependency cycle.
+        if not (name and f ~= bar and f ~= snapHighlight and f ~= configFrame and not name:find("Tooltip")) then return end
+        if not (f.IsVisible and f:IsVisible() and f.GetLeft and f:GetLeft()) then return end
+        if CB_EffectiveAlpha(f) <= 0.05 then return end
+        local w, h = f:GetWidth(), f:GetHeight()
+        if not (w and h and w >= 16 and h >= 16 and w <= maxW and h <= maxH) then return end
+        seen[f] = true
+        fn(f, name)
+    end
+
+    local roots = { UIParent }
+    if _G.ElvUIParent then roots[#roots + 1] = _G.ElvUIParent end
+    for _, root in ipairs(roots) do
+        for _, f in ipairs({ root:GetChildren() }) do tryFrame(f) end
+    end
+    -- oUF unit frames (ElvUI's instance is ElvUF; bare oUF as a fallback). seen[] dedups any that are
+    -- also direct children so they aren't considered twice.
+    local function addOUF(ouf)
+        if type(ouf) == "table" and type(ouf.objects) == "table" then
+            for _, f in ipairs(ouf.objects) do tryFrame(f) end
+        end
+    end
+    addOUF(_G.ElvUF)
+    addOUF(_G.oUF)
+end
+NS.actionBarShown    = false   -- persisted in CleanBot_SavedVars.actionBarShown
+NS.actionBarEditMode = false   -- session-only
+NS.actionBarSnap     = true    -- persisted in CleanBot_SavedVars.actionBarSnap; gates edge snapping
+
+-- Reflects group passive state: the icon is saturated (full color) when any bot is passive,
+-- desaturated (grayed) otherwise. Registered as a command refresher so it tracks the Manage
+-- tab's checkbox and co? replies.
+local function refreshPassiveBtn()
+    local b = slotBtns.passive
+    if not b then return end
+    b.icon:SetDesaturated(not NS.CB_GetGroupPassive())
+end
+
+-- ── Movement flyout (Follow / Runaway / Stay) ────────────────────────────────
+-- The affected/displayed movement context follows the PLAYER's combat state: in combat → entry.combat,
+-- else entry.nonCombat. A button is lit when its movement is the active value for that context (the
+-- "any member" rule, like Passive). Runaway sets the "runaway" strategy in the COMBAT context, with
+-- the previous combat movement restored automatically when combat ends.
+local function playerCombatSection()
+    return UnitAffectingCombat("player") and "combat" or "nonCombat"
+end
+
+-- Desaturates the movement host (its current main action) and each visible flyout child by whether its
+-- action's movement strategy is the group's active value for the current combat context. Works whichever
+-- movement action is currently the main (they're promotable).
+local function refreshMoveBtns()
+    local m = slotBtns.movement
+    if not m or not m.childFrames then return end
+    local section = playerCombatSection()
+    if m._action and m._action.moveField then
+        m.icon:SetDesaturated(not NS.CB_GroupMovementActive(section, m._action.moveField))
+    end
+    for _, cf in ipairs(m.childFrames) do
+        if cf:IsShown() and cf._action and cf._action.moveField then
+            cf.icon:SetDesaturated(not NS.CB_GroupMovementActive(section, cf._action.moveField))
+        end
+    end
+end
+
+-- An explicit Follow/Stay choice supersedes a pending Runaway revert.
+local function cancelRunawayRevert() pendingRunawayRevert = nil end
+
+-- Follow / Stay: set the group's movement for the player-combat-state context.
+local function setMovement(field)
+    cancelRunawayRevert()
+    NS.CB_SetGroupMovement(playerCombatSection(), field)
+    NS.CB_RefreshCommands()
+end
+
+-- Runaway: set the group's COMBAT movement to Run Away, remembering each member's previous combat
+-- movement (only on the first press, so repeats don't overwrite the original) for restore on combat end.
+local function runawayMovement()
+    pendingRunawayRevert = pendingRunawayRevert or {}
+    if NS.CB_ForEachGroupMember then
+        NS.CB_ForEachGroupMember(function(_, name)
+            local key = name and strlower(name)
+            local e = key and CleanBot_PartyBots[key]
+            if e and pendingRunawayRevert[key] == nil then
+                local cur = false  -- false = "Free Roam" (no movement strategy set)
+                if e.combat then
+                    for _, m in ipairs(NS.MOVEMENT_STRATEGIES or {}) do
+                        if e.combat[m.field] then cur = m.field; break end
+                    end
+                end
+                pendingRunawayRevert[key] = { name = name, prev = cur }
+            end
+        end)
+    end
+    NS.CB_SetGroupMovement("combat", "mRunaway")
+    NS.CB_RefreshCommands()
+end
+
+-- On combat end: restore each remembered bot's previous combat movement (per-member — they may differ).
+local function revertRunaway()
+    if not pendingRunawayRevert then return end
+    for key, info in pairs(pendingRunawayRevert) do
+        local e = CleanBot_PartyBots[key]
+        if e then
+            local field = info.prev or nil   -- false → nil (Free Roam, clears all five)
+            e.combat = e.combat or {}
+            for _, m in ipairs(NS.MOVEMENT_STRATEGIES or {}) do e.combat[m.field] = (m.field == field) end
+            NS.CB_SendBotCommand(info.name, "co " .. NS.CB_MovementToggleString(field))
+        end
+    end
+    pendingRunawayRevert = nil
+    NS.CB_RefreshCommands()
+end
+
+
+local function applyVisibility()
+    if not bar then return end
+    if NS.actionBarShown or NS.actionBarEditMode then bar:Show() else bar:Hide() end
+end
+
+-- ── Anchor model (position + grow-from corner) ───────────────────────────────
+-- The bar is anchored BY one of its four corners (`growFrom`) to the SAME-named corner of `relTo`,
+-- offset by (x, y). Pinning a corner means that corner stays put if the bar's size changes (e.g. more
+-- buttons) — the bar grows away from it. x/y are screen-axis offsets: +x right, +y up, at any corner.
+local CORNERS = { "BOTTOMLEFT", "BOTTOMRIGHT", "TOPLEFT", "TOPRIGHT" }
+local CORNER_LABEL = {
+    BOTTOMLEFT = "Bottom Left", BOTTOMRIGHT = "Bottom Right",
+    TOPLEFT = "Top Left", TOPRIGHT = "Top Right",
+}
+-- Grow direction: the axis/way the bar's buttons flow out from the anchored corner.
+local GROW_DIRS = { "UP", "DOWN", "LEFT", "RIGHT" }
+local DIR_LABEL = { UP = "Up", DOWN = "Down", LEFT = "Left", RIGHT = "Right" }
+
+-- Default: top-right of the screen (20px in, 220px down), pinned by its top-right corner; buttons flow
+-- to the right.
+local anchor = { relTo = "UIParent", growFrom = "TOPRIGHT", x = -20, y = -220, growDir = "RIGHT" }
+
+-- Overlap area of two screen rects (0 if disjoint). Shared by the flyout + config placement logic.
+local function CB_RectOverlap(al, ab, ar, at, bl, bb, br, bt)
+    local ix = math.max(0, math.min(ar, br) - math.max(al, bl))
+    local iy = math.max(0, math.min(at, bt) - math.max(ab, bb))
+    return ix * iy
+end
+
+-- Config-frame helpers (defined with the build, used during drag). Forward-declared.
+local CB_PositionConfig, CB_RefreshConfig
+
+-- Screen coords of `corner` ("TOPLEFT"…) of a frame: x picks the right edge for *RIGHT, else left; y
+-- picks the top edge for TOP*, else bottom.
+local function CB_FrameCorner(f, corner)
+    local l, b, w, h = f:GetLeft(), f:GetBottom(), f:GetWidth(), f:GetHeight()
+    if not (l and b and w and h) then return nil end
+    return l + (corner:find("RIGHT") and w or 0), b + (corner:find("TOP") and h or 0)
+end
+
+-- Re-pins the bar from the current `anchor`. Safe before build (guards on bar).
+local function CB_ApplyAnchor()
+    if not bar then return end
+    bar:ClearAllPoints()
+    bar:SetPoint(anchor.growFrom, _G[anchor.relTo] or UIParent, anchor.growFrom, anchor.x, anchor.y)
+end
+
+local function CB_SaveAnchor()
+    if CleanBot_SavedVars then
+        CleanBot_SavedVars.actionBarAnchor = {
+            relTo = anchor.relTo, growFrom = anchor.growFrom,
+            x = anchor.x, y = anchor.y, growDir = anchor.growDir,
+        }
+    end
+end
+
+-- Lays out the bar's buttons (in flow order) for the current grow direction and sizes the bar to fit.
+-- Horizontal directions make a wide bar; vertical ones a tall bar. The anchored corner stays pinned
+-- across the resize because the bar is anchored BY that corner (see CB_ApplyAnchor).
+local function CB_LayoutBar()
+    if not bar or #barButtons == 0 then return end
+    local dir   = anchor.growDir or "RIGHT"
+    local n     = #barButtons
+    local horiz = (dir == "RIGHT" or dir == "LEFT")
+    local along = n * BTN + (n - 1) * GAP
+    bar:SetSize(
+        horiz and (PAD + along + PAD) or (PAD + BTN + PAD),
+        horiz and (PAD + BTN + PAD)   or (PAD + along + PAD))
+    for i, b in ipairs(barButtons) do
+        local off = (i - 1) * (BTN + GAP)
+        b:ClearAllPoints()
+        if dir == "RIGHT" then
+            b:SetPoint("TOPLEFT",     bar, "TOPLEFT",      PAD + off, -PAD)
+        elseif dir == "LEFT" then
+            b:SetPoint("TOPRIGHT",    bar, "TOPRIGHT",   -(PAD + off), -PAD)
+        elseif dir == "DOWN" then
+            b:SetPoint("TOPLEFT",     bar, "TOPLEFT",      PAD, -(PAD + off))
+        else -- UP
+            b:SetPoint("BOTTOMLEFT",  bar, "BOTTOMLEFT",   PAD,   PAD + off)
+        end
+    end
+end
+
+-- Recomputes anchor.x/y so the bar keeps its CURRENT screen position under the current relTo+growFrom.
+-- Used after a drag (relTo just changed) and after a grow-from change (so the bar doesn't jump).
+local function CB_RecomputeOffsets()
+    local bx, by = CB_FrameCorner(bar, anchor.growFrom)
+    local fx, fy = CB_FrameCorner(_G[anchor.relTo] or UIParent, anchor.growFrom)
+    if bx and fx then anchor.x, anchor.y = bx - fx, by - fy end
+end
+
+-- ── Live drag with edge snapping (edit mode) ─────────────────────────────────
+-- The bar follows the cursor; when one of its edges comes within SNAP_DIST of a candidate frame's
+-- edge, that SINGLE axis locks flush to the frame (the nearest edge wins) while the other axis keeps
+-- following the cursor — so the bar slides along the frame's edge. On release it anchors to whatever
+-- frame it ended up snapped to (so it follows that frame), else to UIParent. Position is preserved.
+local dragGrabX, dragGrabY  -- cursor offset from the bar's bottom-left, captured on mouse-down
+local dragSnap              -- current snap { frame, edge, axis, value, dist } (nil = free)
+local dragging              -- true while a drag is in progress (guards double mouse-up)
+
+-- Each snap edge-key maps to the side of the candidate frame it touches — used to draw the blue edge
+-- strip. Both the flush ("left↔left") and the abutting ("bar left ↔ frame right") snaps share a side.
+local EDGE_SIDE = {
+    xLeft  = "LEFT",   xAbutLeft  = "LEFT",
+    xRight = "RIGHT",  xAbutRight = "RIGHT",
+    yBottom = "BOTTOM", yAbutBelow = "BOTTOM",
+    yTop    = "TOP",    yAbutAbove = "TOP",
+}
+
+-- Best single-axis snap for a proposed bottom-left, within `maxDist`: { axis, edge, value, dist, frame },
+-- or nil. When `onlyFrame`/`onlyEdge` are set, only that exact candidate edge is considered (sticky
+-- release check) so a held snap stays on the same edge instead of jumping sides near a corner.
+local function CB_BestSnap(newLeft, newBottom, maxDist, onlyFrame, onlyEdge)
+    local w, h = bar:GetWidth(), bar:GetHeight()
+    local bl, br, bb, bt = newLeft, newLeft + w, newBottom, newBottom + h
+    local best
+    CB_ForEachSnapCandidate(function(f, name)
+        if onlyFrame and name ~= onlyFrame then return end
+        local cl, cr, ct, cb = f:GetLeft(), f:GetRight(), f:GetTop(), f:GetBottom()
+        -- X-axis (vertical-edge) snaps require the bar to be vertically near the frame; Y the reverse.
+        local vNear = bb <= ct + maxDist and bt >= cb - maxDist
+        local hNear = bl <= cr + maxDist and br >= cl - maxDist
+        -- True extent overlap on the PERPENDICULAR axis marks the edge the bar is sliding along: an
+        -- x-edge whose vertical ranges overlap, or a y-edge whose horizontal ranges overlap. Preferred
+        -- over a merely-nearer edge so dragging in from the side of a short, wide frame catches its
+        -- left/right edge instead of its nearby top/bottom.
+        local vOverlap = bb < ct and bt > cb
+        local hOverlap = bl < cr and br > cl
+        local function consider(axis, edge, value, dist, near, overlap)
+            if onlyEdge and edge ~= onlyEdge then return end
+            if not (near and dist <= maxDist) then return end
+            if not best
+               or (overlap and not best.overlap)
+               or (overlap == best.overlap and dist < best.dist) then
+                best = { axis = axis, edge = edge, value = value, dist = dist, frame = name, overlap = overlap }
+            end
+        end
+        consider("x", "xLeft",      cl,                math.abs(bl - cl), vNear, vOverlap)  -- left ↔ left
+        consider("x", "xRight",     cr - w,            math.abs(br - cr), vNear, vOverlap)  -- right ↔ right
+        consider("x", "xAbutRight", cr + SNAP_GAP,     math.abs(bl - cr), vNear, vOverlap)  -- abut right of frame
+        consider("x", "xAbutLeft",  cl - w - SNAP_GAP, math.abs(br - cl), vNear, vOverlap)  -- abut left of frame
+        consider("y", "yBottom",    cb,                math.abs(bb - cb), hNear, hOverlap)  -- bottom ↔ bottom
+        consider("y", "yTop",       ct - h,            math.abs(bt - ct), hNear, hOverlap)  -- top ↔ top
+        consider("y", "yAbutAbove", ct + SNAP_GAP,     math.abs(bb - ct), hNear, hOverlap)  -- abut above frame
+        consider("y", "yAbutBelow", cb - h - SNAP_GAP, math.abs(bt - cb), hNear, hOverlap)  -- abut below frame
+    end)
+    return best
+end
+
+-- Highlights the frame the bar is snapped to: a green wash over the whole frame, a brighter blue strip
+-- on the exact edge being snapped to, and the frame's name centered on it. Passing nil hides it all.
+local EDGE_THICK = 3
+local function CB_UpdateSnapHighlight(snap)
+    if not snapHighlight then return end
+    local f = snap and _G[snap.frame]
+    if not (f and f.GetLeft and f:GetLeft()) then snapHighlight:Hide() return end
+    snapHighlight:ClearAllPoints()
+    snapHighlight:SetPoint("TOPLEFT", f, "TOPLEFT", 0, 0)
+    snapHighlight:SetPoint("BOTTOMRIGHT", f, "BOTTOMRIGHT", 0, 0)
+    snapHighlight.label:SetText(snap.frame)
+
+    local edge, side = snapHighlight.edge, EDGE_SIDE[snap.edge]
+    edge:ClearAllPoints()
+    if side == "LEFT" then
+        edge:SetPoint("TOPLEFT"); edge:SetPoint("BOTTOMLEFT"); edge:SetWidth(EDGE_THICK)
+    elseif side == "RIGHT" then
+        edge:SetPoint("TOPRIGHT"); edge:SetPoint("BOTTOMRIGHT"); edge:SetWidth(EDGE_THICK)
+    elseif side == "TOP" then
+        edge:SetPoint("TOPLEFT"); edge:SetPoint("TOPRIGHT"); edge:SetHeight(EDGE_THICK)
+    else -- BOTTOM
+        edge:SetPoint("BOTTOMLEFT"); edge:SetPoint("BOTTOMRIGHT"); edge:SetHeight(EDGE_THICK)
+    end
+    snapHighlight:Show()
+end
+
+-- Per-frame drag tick: follow the cursor, then lock the one nearest snapping edge.
+-- Hysteresis: while snapped, keep the SAME frame AND edge until the bar drifts past SNAP_RELEASE from
+-- it; only then is a fresh snap acquired within the tighter SNAP_DIST. This stops the bar from
+-- flickering between frames (or between the two edges of a corner) that sit close together.
+local function CB_DragUpdate()
+    local scale = bar:GetEffectiveScale()
+    if not scale or scale == 0 then return end
+    local cx, cy = GetCursorPosition()
+    local newLeft   = cx / scale - dragGrabX
+    local newBottom = cy / scale - dragGrabY
+    local snap
+    if NS.actionBarSnap then
+        if dragSnap then
+            snap = CB_BestSnap(newLeft, newBottom, SNAP_RELEASE, dragSnap.frame, dragSnap.edge)
+        end
+        if not snap then
+            snap = CB_BestSnap(newLeft, newBottom, SNAP_DIST)
+        end
+    end
+    dragSnap = snap
+    if snap then
+        if snap.axis == "x" then newLeft = snap.value else newBottom = snap.value end
+    end
+    bar:ClearAllPoints()
+    bar:SetPoint("BOTTOMLEFT", UIParent, "BOTTOMLEFT", newLeft, newBottom)
+    CB_UpdateSnapHighlight(snap)
+    -- Keep the anchor state (and the config readout) live mid-drag without persisting: provisional
+    -- relTo is whatever we're snapped to, else UIParent. CB_FinishDrag re-derives + saves on release.
+    anchor.relTo = (snap and snap.frame) or "UIParent"
+    CB_RecomputeOffsets()
+    if CB_PositionConfig then CB_PositionConfig() end
+    if CB_RefreshConfig then CB_RefreshConfig() end
+end
+
+-- Mouse-up: anchor to the snapped frame (so the bar follows it) or UIParent, keeping the on-screen
+-- position, then persist. (Called by the shared capture frame.)
+local function CB_FinishDrag()
+    if not dragging then return end
+    dragging = false
+    NS.CB_EndCapture()
+    CB_UpdateSnapHighlight(nil)
+    local snapFrame = dragSnap and dragSnap.frame
+    local f = snapFrame and _G[snapFrame]
+    anchor.relTo = (f and f:GetLeft()) and snapFrame or "UIParent"
+    CB_RecomputeOffsets()   -- offsets at growFrom for the final on-screen position
+    CB_ApplyAnchor()
+    CB_SaveAnchor()
+    if CB_PositionConfig then CB_PositionConfig() end
+    if CB_RefreshConfig then CB_RefreshConfig() end
+end
+
+-- Begins dragging immediately on mouse-down (we're in edit mode, so that's fine), via the shared
+-- capture frame which tracks the cursor + mouse-up anywhere on screen.
+local function CB_BeginDrag()
+    local scale = bar:GetEffectiveScale()
+    if not scale or scale == 0 then return end
+    GameTooltip:Hide()   -- drop the edit-tooltip's SetOwner anchor so re-anchoring can't cycle
+    local cx, cy = GetCursorPosition()
+    dragGrabX = cx / scale - bar:GetLeft()
+    dragGrabY = cy / scale - bar:GetBottom()
+    dragSnap = nil
+    dragging = true
+    -- The capture frame catches the mouse-up when the cursor has moved off the overlay; the
+    -- overlay's own OnMouseUp catches it when released in place (WoW delivers the button-up to
+    -- the frame that owned the button-down). CB_FinishDrag is guarded so only the first wins.
+    NS.CB_BeginCapture(CB_DragUpdate, CB_FinishDrag)
+end
+
+-- ── State setters (shared by the minimap and Settings, like the debug setters) ──
+--- Shows/hides the action bar and persists the choice.
+---@param on boolean
+NS.CB_SetActionBarShown = function(on)
+    NS.actionBarShown = on and true or false
+    if CleanBot_SavedVars then CleanBot_SavedVars.actionBarShown = NS.actionBarShown end
+    applyVisibility()
+    if NS.CB_RefreshActionBarChecks then NS.CB_RefreshActionBarChecks() end
+end
+NS.CB_ToggleActionBar = function() NS.CB_SetActionBarShown(not NS.actionBarShown) end
+
+--- Toggles edit mode (session only): edit forces the bar visible, swaps the overlay on (which
+--- covers + disables the buttons), and is the drag handle; off restores the saved shown state.
+---@param on boolean
+NS.CB_SetActionBarEditMode = function(on)
+    NS.actionBarEditMode = on and true or false
+    if overlay then
+        if NS.actionBarEditMode then overlay:Show() else overlay:Hide() end
+    end
+    applyVisibility()
+    if configFrame then
+        if NS.actionBarEditMode then
+            CB_PositionConfig()
+            CB_RefreshConfig()
+            configFrame:Show()
+        else
+            configFrame:Hide()
+        end
+    end
+    if NS.CB_RefreshActionBarChecks then NS.CB_RefreshActionBarChecks() end
+end
+NS.CB_ToggleActionBarEditMode = function() NS.CB_SetActionBarEditMode(not NS.actionBarEditMode) end
+
+-- ── Flyout geometry (shared by the single-level and nested flyouts) ──────────
+-- One set of helpers so every flyout — the reorderable Attack/Movement/Release ones and the nested
+-- Recruit tree — expands the same predictable way: perpendicular to its reference flow, away from the
+-- bar and the snapped frame, biased toward the screen center.
+
+-- Screen rect a flyout would occupy growing `dir` from `btn`, for `n` BTN-sized children.
+local function CB_FlyoutRect(btn, dir, n)
+    local bl, bb = btn:GetLeft(), btn:GetBottom()
+    if not bl then return end
+    local bw, bh, len = btn:GetWidth(), btn:GetHeight(), n * (BTN + GAP)
+    if dir == "DOWN"  then return bl, bb - len, bl + bw, bb end
+    if dir == "UP"    then return bl, bb + bh, bl + bw, bb + bh + len end
+    if dir == "RIGHT" then return bl + bw, bb, bl + bw + len, bb + bh end
+    return bl - len, bb, bl, bb + bh   -- LEFT
+end
+
+-- Pure: score a candidate flyout rect (higher = better). Priority, by magnitude of each term:
+-- staying on-screen (×1000 of the off-screen edge length) ≫ not overlapping any `avoid` rect (overlap
+-- AREA, so even weight 1 dwarfs the center term) ≫ sitting near the screen center (a small tiebreaker).
+-- `avoid` = list of { l, b, r, t } rects. Exposed for spec/actionbar_flyout_spec.lua.
+function NS.CB_ScoreFlyoutDir(l, b, r, t, avoid, sw, sh)
+    local off   = math.max(0, -l) + math.max(0, r - sw) + math.max(0, -b) + math.max(0, t - sh)
+    local score = -1000 * off
+    for _, a in ipairs(avoid or {}) do
+        score = score - CB_RectOverlap(l, b, r, t, a[1], a[2], a[3], a[4])
+    end
+    local cx, cy = (l + r) / 2, (b + t) / 2
+    score = score - 0.5 * (math.abs(cx - sw / 2) + math.abs(cy - sh / 2))
+    return score
+end
+
+-- Rects every flyout dodges: the bar itself, and the frame the bar is snapped to (it sits flush beside
+-- the bar). Nested flyouts append their parent flyout's rect so a child never covers its parent.
+local function CB_BarAvoidRects()
+    local out = {}
+    if bar and bar:GetLeft() then out[#out + 1] = { bar:GetLeft(), bar:GetBottom(), bar:GetRight(), bar:GetTop() } end
+    local rf = anchor.relTo ~= "UIParent" and _G[anchor.relTo]
+    if rf and rf.GetLeft and rf:GetLeft() then out[#out + 1] = { rf:GetLeft(), rf:GetBottom(), rf:GetRight(), rf:GetTop() } end
+    return out
+end
+
+-- Best flyout direction: the side of the axis PERPENDICULAR to `refDir` (the bar's grow direction at
+-- level 1, the parent flyout's flow when nested) with the best score. `n` = child count.
+local function CB_ChooseFlyoutDir(btn, refDir, n, avoid)
+    local opts = (refDir == "UP" or refDir == "DOWN") and { "RIGHT", "LEFT" } or { "DOWN", "UP" }
+    local sw, sh = UIParent:GetWidth(), UIParent:GetHeight()
+    local best, bestScore
+    for _, dir in ipairs(opts) do
+        local l, b, r, t = CB_FlyoutRect(btn, dir, n)
+        if l then
+            local s = NS.CB_ScoreFlyoutDir(l, b, r, t, avoid, sw, sh)
+            if not bestScore or s > bestScore then bestScore, best = s, dir end
+        end
+    end
+    return best or opts[1]
+end
+
+-- (Re)anchors `flyout` + its `children` for `dir` and sizes it to fit. The near edge is flush with
+-- `btn`; children are inset by GAP so the leading strip bridges the hover gap. Stamps flyout._dir
+-- (the flow axis — read by shift-drag child reorder and by nested sub-flyout direction choice).
+local function CB_LayoutFlyout(flyout, btn, children, dir)
+    flyout._dir = dir
+    local n = #children
+    if n == 0 then return end
+    local vertical = (dir == "UP" or dir == "DOWN")
+    flyout:ClearAllPoints()
+    flyout:SetSize(vertical and BTN or n * (BTN + GAP), vertical and n * (BTN + GAP) or BTN)
+    local fp = (dir == "DOWN" and "TOP") or (dir == "UP" and "BOTTOM") or (dir == "RIGHT" and "LEFT") or "RIGHT"
+    local bp = (dir == "DOWN" and "BOTTOM") or (dir == "UP" and "TOP") or (dir == "RIGHT" and "RIGHT") or "LEFT"
+    flyout:SetPoint(fp, btn, bp, 0, 0)
+    for i, child in ipairs(children) do
+        child:ClearAllPoints()
+        local ref = (i == 1) and flyout or children[i - 1]
+        if dir == "DOWN" then
+            child:SetPoint("TOP", ref, i == 1 and "TOP" or "BOTTOM", 0, -GAP)
+        elseif dir == "UP" then
+            child:SetPoint("BOTTOM", ref, i == 1 and "BOTTOM" or "TOP", 0, GAP)
+        elseif dir == "RIGHT" then
+            child:SetPoint("LEFT", ref, i == 1 and "LEFT" or "RIGHT", GAP, 0)
+        else
+            child:SetPoint("RIGHT", ref, i == 1 and "RIGHT" or "LEFT", -GAP, 0)
+        end
+    end
+end
+
+-- ── Flyout button (expands to reveal more buttons) ───────────────────────────
+-- Hint appended to every flyout button's tooltip (after a blank line) so the right-click behavior is
+-- discoverable. Kept as a constant so it's edited in one place.
+local FLYOUT_HINT = "|cFF80CCFFRight-Click to toggle this flyout|r"   -- light blue
+
+-- A bar button whose main (left-click) action is REASSIGNABLE, plus a stack of extra buttons revealed
+-- on hover (auto-closes when the pointer leaves) or pinned open by right-click. The host + its child
+-- frames are generic display surfaces: SetActiveOrder assigns the enabled actions to them (actions[1]
+-- → host, the rest → child frames), so reordering can change which action is the main. The stack
+-- expands AWAY from the frame the bar is anchored to (defaults downward when the bar is free).
+local function CB_CreateFlyoutButton(parent, name)
+    local btn = NS.CB_CreateIconButton(parent, name, nil, BTN, nil)
+    btn:RegisterForClicks("LeftButtonUp", "RightButtonUp")
+    -- Tooltip reads the CURRENT main action (btn._title/_desc, set by SetActiveOrder), plus the hint.
+    NS.CB_SetTooltip(btn,
+        function() return btn._title end,
+        function() return (btn._desc and (btn._desc .. "\n\n") or "") .. FLYOUT_HINT end)
+
+    -- Child container. Parented to the button so it inherits MEDIUM strata (children stay interactive);
+    -- raised a few levels so it draws above the bar. Anchored contiguous with the button (no gap
+    -- between their hit rects) so moving the pointer into it never crosses a dead zone.
+    local flyout = CreateFrame("Frame", name .. "Flyout", btn)
+    flyout:SetFrameLevel(btn:GetFrameLevel() + 5)
+    flyout:Hide()
+    -- childFrames = the pool of generic flyout display surfaces (created by AddChildSlot); children = the
+    -- currently VISIBLE ones that layout() draws (set by SetActiveOrder). _actionsById set by the build.
+    btn.flyout, btn.children, btn.childFrames, btn._actionsById = flyout, {}, {}, {}
+
+    -- Lays out + shows the flyout, choosing its direction with the shared geometry (perpendicular to
+    -- the bar's flow, away from the bar + snapped frame, biased toward screen center).
+    local function open()
+        local dir = CB_ChooseFlyoutDir(btn, anchor.growDir, #btn.children, CB_BarAvoidRects())
+        CB_LayoutFlyout(flyout, btn, btn.children, dir)
+        flyout:Show()
+    end
+
+    -- Hover opens; close when the pointer is over neither the button nor the open flyout (and it isn't
+    -- pinned). Polled via OnUpdate (runs only while shown) so no OnLeave can be missed mid-traverse.
+    local function pointerInside() return btn:IsMouseOver() or flyout:IsMouseOver() end
+    flyout:SetScript("OnUpdate", function(self, elapsed)
+        self._t = (self._t or 0) + elapsed
+        if self._t < 0.1 then return end
+        self._t = 0
+        if not self.pinned and not pointerInside() then self:Hide() end
+    end)
+    btn:HookScript("OnEnter", open)
+
+    btn:SetScript("OnClick", function(_, mouseButton)
+        if mouseButton == "RightButton" then       -- toggle pinned-open (survives the pointer leaving)
+            flyout.pinned = not flyout.pinned
+            if flyout.pinned then open() else flyout:Hide() end
+        elseif btn._action and btn._action.onClick then
+            btn._action.onClick()
+        end
+    end)
+
+    -- Sets the host's displayed action (icon + click + tooltip + reorder identity).
+    function btn:SetMain(action)
+        self.icon:SetTexture(action and action.icon)
+        self._action, self._actionId = action, action and action.id
+        self._title, self._desc = action and action.title, action and action.desc
+    end
+
+    -- Creates one generic flyout display surface (its displayed action is assigned by SetActiveOrder).
+    -- Returns the frame so the caller can wire shift-drag reorder onto it.
+    function btn:AddChildSlot(idx)
+        local cf   -- declared first so the click closure captures it as an upvalue (its action is dynamic)
+        cf = NS.CB_CreateIconButton(flyout, name .. "Fly" .. idx, nil, BTN, function()
+            if cf._action and cf._action.onClick then cf._action.onClick() end
+            if not flyout.pinned then flyout:Hide() end
+        end)
+        NS.CB_SetTooltip(cf, function() return cf._title end, function() return cf._desc end)
+        self.childFrames[#self.childFrames + 1] = cf
+        return cf
+    end
+
+    -- Assigns enabled action ids (in order) to the host + child frames: ids[1] → host, ids[2..] → child
+    -- frames (shown, in order), extra frames hidden. `children` (what layout() draws) becomes the shown
+    -- frames. Re-layouts if the flyout is open.
+    function btn:SetActiveOrder(enabledIds)
+        self:SetMain(enabledIds[1] and self._actionsById[enabledIds[1]] or nil)
+        self.children = {}
+        for i, cf in ipairs(self.childFrames) do
+            local a = enabledIds[i + 1] and self._actionsById[enabledIds[i + 1]]
+            if a then
+                cf.icon:SetTexture(a.icon)
+                cf._action, cf._actionId, cf._title, cf._desc = a, a.id, a.title, a.desc
+                cf:Show()
+                self.children[#self.children + 1] = cf
+            else
+                cf:Hide()
+            end
+        end
+        if flyout:IsShown() then open() end
+    end
+
+    return btn
+end
+
+-- Flyout node icons can be partly transparent (class crests, LFG role glyphs) — unlike the bar's
+-- opaque spell icons — so they'd otherwise show no fill. Give every node button an opaque dark backing
+-- behind its icon so it reads as a solid button. Behind an opaque icon (gender) it's simply hidden, so
+-- it's safe to apply uniformly. (0.06 matches the addon's other dark fills, e.g. CB_SkinEditBoxSafe.)
+local function CB_AddNodeBackground(btn)
+    local bg = btn:CreateTexture(nil, "BACKGROUND")
+    bg:SetTexture(0.06, 0.06, 0.06, 1)
+    bg:SetAllPoints(btn)
+end
+
+-- ── Nested flyout (recruit tree) ─────────────────────────────────────────────
+-- A recursively-nestable flyout built from a `node` tree. Each node:
+--   { id, icon, texcoord = fn|nil, title, desc, onClick = fn|nil, children = {node,…}|nil }
+-- A node with `children` opens its own sub-flyout on hover; sub-flyouts are created lazily on first
+-- open and pooled (frames can't be destroyed in 3.3.5a). Every level uses the shared geometry, so each
+-- sub-flyout grows perpendicular to its parent flyout's flow, away from the bar + snapped frame +
+-- parent flyout, biased toward screen center. Hover anywhere in the open chain keeps it up; leaving
+-- the whole subtree (or clicking a node, unless pinned) closes it. Right-click the host pins level 1.
+-- `host` is the bar button; its left-click action + right-click pin are wired by the caller.
+local function CB_CreateNestedFlyout(host, nodes)
+    local rootFlyout = CreateFrame("Frame", host:GetName() .. "Flyout", host)
+    rootFlyout:SetFrameLevel(host:GetFrameLevel() + 5)
+    rootFlyout:Hide()
+    host.flyout = rootFlyout
+
+    local closeTree, openSub, nodeHovered, populate
+
+    -- Hides a flyout and everything open beneath it.
+    closeTree = function(fly)
+        if not fly then return end
+        if fly._activeChild then closeTree(fly._activeChild); fly._activeChild = nil end
+        fly:Hide()
+    end
+
+    -- Opens node-button `nb`'s sub-flyout as the active child of its `container` (building it once).
+    openSub = function(nb, container)
+        local sub = nb.subFlyout
+        if not sub then
+            sub = CreateFrame("Frame", nb:GetName() .. "Sub", nb)
+            sub:SetFrameLevel(nb:GetFrameLevel() + 5)
+            populate(sub, nb._node.children)
+            nb.subFlyout = sub
+        end
+        container._activeChild = sub
+        local avoid = CB_BarAvoidRects()
+        if container:GetLeft() then
+            avoid[#avoid + 1] = { container:GetLeft(), container:GetBottom(), container:GetRight(), container:GetTop() }
+        end
+        local dir = CB_ChooseFlyoutDir(nb, container._dir or "DOWN", #sub._btns, avoid)
+        CB_LayoutFlyout(sub, nb, sub._btns, dir)
+        sub:Show()
+    end
+
+    -- On hovering a node: close a sibling's open sub-flyout, then open this node's (if it has children).
+    nodeHovered = function(nb, container)
+        if container._activeChild and container._activeChild ~= nb.subFlyout then
+            closeTree(container._activeChild)
+            container._activeChild = nil
+        end
+        if nb._node.children then openSub(nb, container) end
+    end
+
+    -- Builds one button per node into `container` (once; pooled). Recursion happens lazily via openSub.
+    populate = function(container, nodeList)
+        if container._btns then return end
+        container._btns = {}
+        for i, node in ipairs(nodeList) do
+            local nb = NS.CB_CreateIconButton(container, container:GetName() .. "_" .. node.id, node.icon, BTN, nil)
+            CB_AddNodeBackground(nb)   -- solid backing behind transparent class/role glyphs
+            if node.texcoord then nb.icon:SetTexCoord(node.texcoord()) end
+            NS.CB_SetTooltip(nb, node.title, node.desc)
+            nb._node = node
+            nb:HookScript("OnEnter", function() nodeHovered(nb, container) end)
+            nb:SetScript("OnClick", function()
+                if node.onClick then node.onClick() end
+                if not rootFlyout.pinned then closeTree(rootFlyout) end
+            end)
+            container._btns[i] = nb
+        end
+    end
+
+    populate(rootFlyout, nodes)
+
+    -- The pointer is "in the chain" if it's over the host or any open flyout from the host down.
+    local function chainInside()
+        if host:IsMouseOver() then return true end
+        local f = rootFlyout
+        while f do
+            if f:IsShown() and f:IsMouseOver() then return true end
+            f = f._activeChild
+        end
+        return false
+    end
+
+    local function openRoot()
+        -- Start at level 1: drop any sub-flyout left over from a prior open (Hide() on a parent
+        -- doesn't clear a child's own shown flag, so a stale sub would otherwise reappear).
+        if rootFlyout._activeChild then closeTree(rootFlyout._activeChild); rootFlyout._activeChild = nil end
+        local dir = CB_ChooseFlyoutDir(host, anchor.growDir, #rootFlyout._btns, CB_BarAvoidRects())
+        CB_LayoutFlyout(rootFlyout, host, rootFlyout._btns, dir)
+        rootFlyout:Show()
+    end
+    host._openFlyout  = openRoot                              -- right-click pin reopens through this
+    host._closeFlyout = function() closeTree(rootFlyout) end  -- recursively hides the whole chain
+
+    rootFlyout:SetScript("OnUpdate", function(self, elapsed)
+        self._t = (self._t or 0) + elapsed
+        if self._t < 0.1 then return end
+        self._t = 0
+        if not self.pinned and not chainInside() then closeTree(self) end
+    end)
+    host:HookScript("OnEnter", openRoot)
+    return rootFlyout
+end
+
+-- Builds the recruit node tree: class → role (the roles that class can fill) → gender. Clicking a
+-- node at any level recruits at that specificity (class only / class+role / class+role+gender) via the
+-- shared NS.CB_Recruit; deeper levels just refine it. Icons: class atlas, LFG role icons, gender icons.
+local RECRUIT_ROLE_LABEL = { TANK = "Tank", HEAL = "Healer", DPS = "DPS" }
+local RECRUIT_ROLE_TOKEN = { TANK = "TANK", HEAL = "HEALER", DPS = "DAMAGER" }   -- GetTexCoordsForRole
+local RECRUIT_GENDER     = {
+    { id = "MALE",   label = "Male",   icon = "Interface\\Icons\\Achievement_Character_Human_Male" },
+    { id = "FEMALE", label = "Female", icon = "Interface\\Icons\\Achievement_Character_Human_Female" },
+}
+local function CB_BuildRecruitTree()
+    local tree = {}
+    -- Classes alphabetical by display name (Death Knight, Druid, Hunter, …) rather than the registry's
+    -- canonical order, so the class column is predictable to scan.
+    local classes = NS.CB_RecruiterAllClasses()
+    table.sort(classes, function(a, b)
+        return ((NS.CLASS_DISPLAY and NS.CLASS_DISPLAY[a]) or a) < ((NS.CLASS_DISPLAY and NS.CLASS_DISPLAY[b]) or b)
+    end)
+    for _, class in ipairs(classes) do
+        local classDisp = (NS.CLASS_DISPLAY and NS.CLASS_DISPLAY[class]) or class
+        local classNode = {
+            id = class, title = classDisp,
+            icon = "Interface\\WorldStateFrame\\Icons-Classes",
+            texcoord = function() return unpack(NS.CLASS_ICON_COORDS[class]) end,
+            desc = "Recruit a " .. classDisp .. " (random role & gender).",
+            onClick = function() NS.CB_Recruit(class, nil, nil, NS.CB_Print, classDisp) end,
+            children = {},
+        }
+        for _, role in ipairs(NS.CB_RecruiterRolesForClass(class)) do
+            local spec     = NS.CB_RecruiterSpec(class, role)
+            local roleDisp = RECRUIT_ROLE_LABEL[role] .. " " .. classDisp
+            local roleNode = {
+                id = role, title = roleDisp,
+                icon = "Interface\\LFGFrame\\UI-LFG-ICON-ROLES",
+                texcoord = function() return GetTexCoordsForRole(RECRUIT_ROLE_TOKEN[role]) end,
+                desc = "Recruit a " .. roleDisp .. " (random gender).",
+                onClick = function() NS.CB_Recruit(class, spec, nil, NS.CB_Print, roleDisp) end,
+                children = {},
+            }
+            for _, g in ipairs(RECRUIT_GENDER) do
+                local gDisp = g.label .. " " .. roleDisp
+                roleNode.children[#roleNode.children + 1] = {
+                    id = g.id, title = gDisp, icon = g.icon,
+                    desc = "Recruit a " .. gDisp .. ".",
+                    onClick = function() NS.CB_Recruit(class, spec, g.id, NS.CB_Print, gDisp) end,
+                }
+            end
+            classNode.children[#classNode.children + 1] = roleNode
+        end
+        tree[#tree + 1] = classNode
+    end
+    return tree
+end
+
+-- The Recruit bar button: a non-reorderable host whose left-click recruits a fully random bot, with a
+-- nested class→role→gender flyout. Right-click pins the flyout open (mirrors the other flyouts).
+local function CB_CreateRecruitButton(parent, name)
+    local btn = NS.CB_CreateIconButton(parent, name, "Interface\\Icons\\INV_Misc_GroupLooking", BTN, nil)
+    btn:RegisterForClicks("LeftButtonUp", "RightButtonUp")
+    NS.CB_SetTooltip(btn, "Recruit",
+        function() return "Left-click: recruit a random bot (matches your level).\n\n" .. FLYOUT_HINT end)
+    CB_CreateNestedFlyout(btn, CB_BuildRecruitTree())
+    btn:SetScript("OnClick", function(_, mouseButton)
+        if mouseButton == "RightButton" then
+            btn.flyout.pinned = not btn.flyout.pinned
+            if btn.flyout.pinned then btn._openFlyout() else btn._closeFlyout() end
+        else
+            local classes = NS.CB_RecruiterAllClasses()
+            local class   = classes[math.random(#classes)]
+            NS.CB_Recruit(class, nil, nil, NS.CB_Print, (NS.CLASS_DISPLAY and NS.CLASS_DISPLAY[class]) or class)
+        end
+    end)
+    return btn
+end
+
+-- ── Config frame (edit mode) ─────────────────────────────────────────────────
+-- A small panel shown beside the bar in edit mode: an "Anchor From" corner dropdown, a "Grow
+-- Direction" dropdown, x/y position editboxes, four 1px nudge buttons, a snapping toggle and Done.
+-- Excluded from snap candidates so the bar can't anchor to it.
+local function CB_BuildConfig()
+    configFrame = CreateFrame("Frame", "CleanBotActionBarConfigFrame", UIParent)
+    configFrame:SetFrameStrata("DIALOG")
+    configFrame:SetSize(180, 250)
+    configFrame:EnableMouse(true)   -- swallow clicks so they don't fall through to the world
+    NS.CB_ApplyFrameSkin(configFrame, 2)
+    configFrame:Hide()
+    local PADC = 10
+    local CONTENT_W = 180 - 2 * PADC   -- inner width the full-span rows fill
+
+    -- Re-pins the bar from the live anchor, persists, and re-flows the config + readout. Shared by
+    -- the dropdowns, editboxes, and nudge buttons.
+    local function applyAndSave()
+        CB_ApplyAnchor()
+        CB_SaveAnchor()
+        CB_PositionConfig()
+        CB_RefreshConfig()
+    end
+
+    -- "Anchor From" label + corner dropdown (the pinned corner; left-aligned at PADC).
+    local anchorLabel = configFrame:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+    anchorLabel:SetText("Anchor From")
+    anchorLabel:SetPoint("TOPLEFT", configFrame, "TOPLEFT", PADC, -PADC)
+
+    local growDD = NS.CB_CreateDropdown(configFrame, "CleanBotActionBarGrowDD", 150)
+    -- The template carries a ~16px left inset; pull left so the visible box lines up with PADC.
+    growDD:SetPoint("TOPLEFT", anchorLabel, "BOTTOMLEFT", -16, -2)
+    UIDropDownMenu_Initialize(growDD, function()
+        for _, corner in ipairs(CORNERS) do
+            local info        = UIDropDownMenu_CreateInfo()
+            info.text         = CORNER_LABEL[corner]
+            info.value        = corner
+            info.notCheckable = 1
+            info.func         = function()
+                anchor.growFrom = corner
+                CB_RecomputeOffsets()   -- keep the bar where it is; only the pinned corner changes
+                applyAndSave()
+            end
+            UIDropDownMenu_AddButton(info)
+        end
+    end)
+    configFrame.growDD = growDD
+
+    -- "Grow Direction" label + dropdown (the way the bar's buttons flow).
+    local dirLabel = configFrame:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+    dirLabel:SetText("Grow Direction")
+    dirLabel:SetPoint("TOPLEFT", anchorLabel, "BOTTOMLEFT", 0, -40)
+
+    local dirDD = NS.CB_CreateDropdown(configFrame, "CleanBotActionBarDirDD", 150)
+    dirDD:SetPoint("TOPLEFT", dirLabel, "BOTTOMLEFT", -16, -2)
+    UIDropDownMenu_Initialize(dirDD, function()
+        for _, d in ipairs(GROW_DIRS) do
+            local info        = UIDropDownMenu_CreateInfo()
+            info.text         = DIR_LABEL[d]
+            info.value        = d
+            info.notCheckable = 1
+            info.func         = function()
+                anchor.growDir = d
+                CB_LayoutBar()          -- reflow the buttons + resize; pinned corner stays put
+                applyAndSave()
+            end
+            UIDropDownMenu_AddButton(info)
+        end
+    end)
+    configFrame.dirDD = dirDD
+
+    -- x / y position editboxes in a full-width holder; each box stretches to fill its half of the row.
+    local xyRow = CreateFrame("Frame", nil, configFrame)
+    xyRow:SetSize(CONTENT_W, 18)
+    xyRow:SetPoint("TOPLEFT", dirLabel, "BOTTOMLEFT", 0, -40)
+
+    local xLabel = xyRow:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+    xLabel:SetText("x:")
+    xLabel:SetPoint("LEFT", xyRow, "LEFT", 0, 0)
+
+    local yLabel = xyRow:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+    yLabel:SetText("y:")
+    yLabel:SetPoint("LEFT", xyRow, "CENTER", 4, 0)
+
+    -- Both boxes anchored on both sides so they grow: xBox fills xLabel→midpoint, yBox fills yLabel→right.
+    local xBox = NS.CB_CreateEditBox(xyRow, "CleanBotActionBarXBox")
+    xBox:SetHeight(18)
+    xBox:SetAutoFocus(false)
+    xBox:SetPoint("LEFT",  xLabel, "RIGHT", 4, 0)
+    xBox:SetPoint("RIGHT", yLabel, "LEFT", -8, 0)
+    configFrame.xBox = xBox
+
+    local yBox = NS.CB_CreateEditBox(xyRow, "CleanBotActionBarYBox")
+    yBox:SetHeight(18)
+    yBox:SetAutoFocus(false)
+    yBox:SetPoint("LEFT",  yLabel, "RIGHT", 4, 0)
+    yBox:SetPoint("RIGHT", xyRow, "RIGHT", 0, 0)
+    configFrame.yBox = yBox
+
+    -- Commit a typed value (Enter or focus loss): valid number → store + re-pin; invalid → revert.
+    local function commit(box, axis)
+        local v = tonumber(box:GetText())
+        if v then anchor[axis] = math.floor(v + 0.5); applyAndSave()
+        else CB_RefreshConfig() end
+        box:ClearFocus()
+    end
+    xBox:SetScript("OnEnterPressed",   function(self) commit(self, "x") end)
+    yBox:SetScript("OnEnterPressed",   function(self) commit(self, "y") end)
+    xBox:SetScript("OnEditFocusLost",  function(self) commit(self, "x") end)
+    yBox:SetScript("OnEditFocusLost",  function(self) commit(self, "y") end)
+    xBox:SetScript("OnEscapePressed",  function(self) CB_RefreshConfig(); self:ClearFocus() end)
+    yBox:SetScript("OnEscapePressed",  function(self) CB_RefreshConfig(); self:ClearFocus() end)
+
+    -- Four 1px nudge buttons: ⟨ ^ v ⟩ → left, up, down, right (screen-axis, regardless of growFrom).
+    local function nudge(dx, dy)
+        anchor.x = anchor.x + dx
+        anchor.y = anchor.y + dy
+        applyAndSave()
+    end
+    local BW, BH = 28, 22
+    local dirs = {
+        { "<", -1,  0 }, { "^",  0,  1 }, { "v",  0, -1 }, { ">",  1,  0 },
+    }
+    -- Spread the fixed-width buttons evenly across the full content width (gap fills the slack).
+    local BGAP = (CONTENT_W - #dirs * BW) / (#dirs - 1)
+    local btnRow = CreateFrame("Frame", nil, configFrame)
+    btnRow:SetSize(CONTENT_W, BH)
+    btnRow:SetPoint("TOPLEFT", xyRow, "BOTTOMLEFT", 0, -8)
+    local prev
+    for i, d in ipairs(dirs) do
+        local btn = NS.CB_CreateButton(btnRow, "CleanBotActionBarNudge" .. i, d[1], BW, BH,
+            function() nudge(d[2], d[3]) end)
+        if i == 1 then
+            btn:SetPoint("LEFT", btnRow, "LEFT", 0, 0)
+        else
+            btn:SetPoint("LEFT", prev, "RIGHT", BGAP, 0)
+        end
+        prev = btn
+    end
+
+    -- Done button (bottom center): leaves edit mode.
+    local doneBtn = NS.CB_CreateButton(configFrame, "CleanBotActionBarDoneBtn", "Done", 80, 22,
+        function() NS.CB_SetActionBarEditMode(false) end)
+    doneBtn:SetPoint("BOTTOM", configFrame, "BOTTOM", 0, PADC)
+
+    -- Snapping toggle (left-aligned, above Done): persists CleanBot_SavedVars.actionBarSnap.
+    local snapCB = NS.CB_CreateLabeledCheckBox(configFrame, "CleanBotActionBarSnapCB", "Snapping",
+        "Snap the bar to nearby frame edges while dragging.")
+    snapCB:SetSize(20, 20)
+    snapCB:SetPoint("BOTTOMLEFT", configFrame, "BOTTOMLEFT", PADC, PADC + 22 + 10)
+    snapCB:SetScript("OnClick", function(self)
+        NS.actionBarSnap = self:GetChecked() and true or false
+        if CleanBot_SavedVars then CleanBot_SavedVars.actionBarSnap = NS.actionBarSnap end
+    end)
+    configFrame.snapCB = snapCB
+
+    -- Pins the config beside the bar. Vertical adjacency (below/above) and horizontal alignment
+    -- (extend right / centered / extend left) are each preferred from where the bar sits relative to a
+    -- centered deadzone, so the panel is pushed away from whichever screen edges the bar is near. The
+    -- vertical default is ABOVE (only a bar near the top pushes it below); bar at top-left → below +
+    -- extending right, etc. But the preference can be overridden: every
+    -- candidate placement is scored so the panel stays on-screen AND avoids covering the frame the bar
+    -- is anchored to (which sits right beside the bar when snapped). On-screen wins first, then
+    -- not-overlapping the anchor frame, then the deadzone preference.
+    local GAPC, DZ = 6, 0.32
+
+    -- Screen rect the config would occupy for a given (vert, horiz) placement.
+    local function rectFor(vert, horiz, bl, bb, br, bt, cw, ch)
+        local l = (horiz == "LEFT" and bl) or (horiz == "RIGHT" and br - cw) or ((bl + br) / 2 - cw / 2)
+        local b = (vert == "BELOW") and (bb - GAPC - ch) or (bt + GAPC)
+        return l, b, l + cw, b + ch
+    end
+    -- Total length of edges hanging off-screen (linear; 0 when fully on-screen).
+    local function offScreen(l, b, r, t, sw, sh)
+        return math.max(0, -l) + math.max(0, r - sw) + math.max(0, -b) + math.max(0, t - sh)
+    end
+    local overlap = CB_RectOverlap
+
+    CB_PositionConfig = function()
+        if not (configFrame and bar) then return end
+        local sw, sh = UIParent:GetWidth(), UIParent:GetHeight()
+        local bl, bb, br, bt = bar:GetLeft(), bar:GetBottom(), bar:GetRight(), bar:GetTop()
+        if not bl then return end
+        local cw, ch = configFrame:GetWidth(), configFrame:GetHeight()
+        local dx = (bl + br) / 2 - sw / 2
+        local dy = (bb + bt) / 2 - sh / 2
+
+        local prefVert  = (dy > DZ * sh) and "BELOW" or "ABOVE"
+        local prefHoriz = (dx < -DZ * sw) and "LEFT" or (dx > DZ * sw) and "RIGHT" or ""
+
+        -- Anchor-frame rect to avoid (skip when anchored to UIParent or unresolved).
+        local rf = anchor.relTo ~= "UIParent" and _G[anchor.relTo]
+        local rl, rb, rr, rt
+        if rf and rf.GetLeft and rf:GetLeft() then
+            rl, rb, rr, rt = rf:GetLeft(), rf:GetBottom(), rf:GetRight(), rf:GetTop()
+        end
+
+        local best, bestScore
+        for _, vert in ipairs({ "BELOW", "ABOVE" }) do
+            for _, horiz in ipairs({ "", "LEFT", "RIGHT" }) do
+                local l, b, r, t = rectFor(vert, horiz, bl, bb, br, bt, cw, ch)
+                local score = -1000 * offScreen(l, b, r, t, sw, sh)
+                if rl then score = score - overlap(l, b, r, t, rl, rb, rr, rt) end
+                if vert  == prefVert  then score = score + 50 end
+                if horiz == prefHoriz then score = score + 25 end
+                if not bestScore or score > bestScore then
+                    bestScore, best = score, { vert = vert, horiz = horiz }
+                end
+            end
+        end
+
+        local cPoint = (best.vert == "BELOW" and "TOP" or "BOTTOM") .. best.horiz
+        local bPoint = (best.vert == "BELOW" and "BOTTOM" or "TOP") .. best.horiz
+        local yoff   = (best.vert == "BELOW") and -GAPC or GAPC
+        configFrame:ClearAllPoints()
+        configFrame:SetPoint(cPoint, bar, bPoint, 0, yoff)
+    end
+
+    -- Syncs the dropdown text and editboxes from the live anchor (no focused box is clobbered).
+    CB_RefreshConfig = function()
+        if not configFrame then return end
+        UIDropDownMenu_SetText(growDD, CORNER_LABEL[anchor.growFrom] or anchor.growFrom)
+        UIDropDownMenu_SetText(dirDD, DIR_LABEL[anchor.growDir] or anchor.growDir)
+        if not xBox:HasFocus() then xBox:SetText(tostring(math.floor((anchor.x or 0) + 0.5))) end
+        if not yBox:HasFocus() then yBox:SetText(tostring(math.floor((anchor.y or 0) + 0.5))) end
+        snapCB:SetChecked(NS.actionBarSnap)
+    end
+end
+
+-- ── Button registry + persisted layout ──────────────────────────────────────
+-- Reconciles a saved id order against the current default order: keeps saved ids that still exist (in
+-- saved order), drops unknown ones, then appends any new default ids (in default order). Pure.
+NS.CB_MergeOrder = function(defaultIds, savedIds)
+    local present, seen, out = {}, {}, {}
+    for _, id in ipairs(defaultIds) do present[id] = true end
+    for _, id in ipairs(savedIds or {}) do
+        if present[id] and not seen[id] then seen[id] = true; out[#out + 1] = id end
+    end
+    for _, id in ipairs(defaultIds) do
+        if not seen[id] then seen[id] = true; out[#out + 1] = id end
+    end
+    return out
+end
+
+-- Returns a copy of `order` with `id` removed and re-inserted at `newIndex` (clamped to [1, #+1]). Pure.
+NS.CB_MoveInOrder = function(order, id, newIndex)
+    local out = {}
+    for _, x in ipairs(order) do if x ~= id then out[#out + 1] = x end end
+    if newIndex < 1 then newIndex = 1 elseif newIndex > #out + 1 then newIndex = #out + 1 end
+    table.insert(out, newIndex, id)
+    return out
+end
+
+-- Declarative slot registry. Each slot = one bar button with an ordered list of `actions`. The FIRST
+-- ENABLED action is the main (left-click) bar button; the remaining enabled actions are its flyout, in
+-- order. Reordering the list (shift-drag) can promote a flyout item to the main and demote the old main
+-- into the flyout. A slot with a single action is a plain button (no flyout). `slot.refresh` (optional)
+-- is a saturation refresher registered once; `action.moveField` ties an action to a movement strategy.
+local ATK = "Interface\\AddOns\\CleanBot\\icons\\attack"
+local function attackCmd(qual)
+    return function() NS.CB_SendGroupCommand((qual and (qual .. " ") or "") .. "do attack my target") end
+end
+local SLOTS = {
+    { id = "summon", frame = "CleanBotActionSummonBtn", title = "Summon", actions = {
+        { id = "summon", icon = "Interface\\Icons\\Spell_Arcane_TeleportStormwind", title = "Summon",
+          desc = "Summon your party/raid bots to you.", onClick = function() NS.CB_SendGroupCommand("summon") end },
+    } },
+
+    { id = "attack", frame = "CleanBotActionAttackBtn", title = "Attack", actions = {
+        { id = "all",    icon = ATK,             title = "Attack — All",     desc = "Order all your bots to attack your target.",    onClick = attackCmd(nil) },
+        { id = "tank",   icon = ATK .. "_tank",   title = "Attack — Tanks",   desc = "Order your tank bots to attack your target.",   onClick = attackCmd("@tank") },
+        { id = "healer", icon = ATK .. "_healer", title = "Attack — Healers", desc = "Order your healer bots to attack your target.", onClick = attackCmd("@heal") },
+        { id = "dps",    icon = ATK .. "_dps",    title = "Attack — DPS",     desc = "Order your DPS bots to attack your target.",    onClick = attackCmd("@dps") },
+        { id = "melee",  icon = ATK .. "_melee",  title = "Attack — Melee",   desc = "Order your melee bots to attack your target.",  onClick = attackCmd("@melee") },
+        { id = "ranged", icon = ATK .. "_ranged", title = "Attack — Ranged",  desc = "Order your ranged bots to attack your target.", onClick = attackCmd("@ranged") },
+    } },
+
+    { id = "pull", frame = "CleanBotActionPullBtn", title = "Pull", actions = {
+        { id = "pull", icon = "Interface\\Icons\\Ability_Hunter_Misdirection", title = "Pull",
+          desc = "Order your tank bots to pull your current target. (Select a mob first.)",
+          onClick = function() NS.CB_SendGroupCommand("pull my target") end },
+    } },
+
+    { id = "passive", frame = "CleanBotActionPassiveBtn", title = "Passive", refresh = refreshPassiveBtn, actions = {
+        { id = "passive", icon = "Interface\\Icons\\Spell_Nature_Sleep", title = "Passive",
+          desc = "Toggle all bots passive — stand down and do nothing in combat.",
+          onClick = function() NS.CB_SetGroupPassive(not NS.CB_GetGroupPassive()); NS.CB_RefreshCommands() end },
+    } },
+
+    { id = "movement", frame = "CleanBotActionFollowBtn", title = "Movement", refresh = refreshMoveBtns, actions = {
+        { id = "follow",  icon = "Interface\\Icons\\Ability_Hunter_BeastSoothe", title = "Follow",
+          desc = "Order your bots to follow you.", onClick = function() setMovement("mFollow") end, moveField = "mFollow" },
+        { id = "stay",    icon = "Interface\\Icons\\Spell_Nature_TimeStop", title = "Stay",
+          desc = "Order your bots to hold position.", onClick = function() setMovement("mStay") end, moveField = "mStay" },
+        { id = "runaway", icon = "Interface\\Icons\\Ability_Rogue_Sprint", title = "Runaway",
+          desc = "Order your bots to keep their distance from enemies. Reverts to their previous combat movement when combat ends.",
+          onClick = runawayMovement, moveField = "mRunaway" },
+    } },
+
+    { id = "release", frame = "CleanBotActionReleaseBtn", title = "Release", actions = {
+        { id = "release", icon = "Interface\\Icons\\Spell_Holy_GuardianSpirit", title = "Release",
+          desc = "Release your bots' spirits when they die.", onClick = function() NS.CB_SendGroupCommand("release") end },
+        { id = "revive",  icon = "Interface\\Icons\\Spell_Holy_Resurrection", title = "Revive",
+          desc = "Revive your bots from their corpses.", onClick = function() NS.CB_SendGroupCommand("revive") end },
+    } },
+
+    -- Recruit: a NESTED, non-reorderable flyout (built by CB_CreateRecruitButton, not from `actions`).
+    -- The single action exists only so the Settings "Customize" list shows one enable/disable toggle.
+    { id = "recruit", frame = "CleanBotActionRecruitBtn", title = "Recruit", nested = true, actions = {
+        { id = "recruit", icon = "Interface\\Icons\\INV_Misc_GroupLooking", title = "Recruit",
+          desc = "Recruit a level-matched bot. Left-click for a random one, or hover to pick class/role/gender." },
+    } },
+
+    -- AI Chatter & Party Prep (Customized for Solo Lab)
+    { id = "chatter", frame = "CleanBotActionChatterBtn", title = "AI Chatter & Prep", actions = {
+        { id = "party_banter", icon = "Interface\\Icons\\Spell_Holy_PrayerOfSpirit", title = "Party Banter",
+          desc = "Prompt your companion bots in /party to trigger AI banter and status discussions.",
+          onClick = function()
+            local prompts = {
+                "How is everyone feeling about this area?",
+                "Status check - everyone ready?",
+                "What's our game plan for the next pull?",
+                "Good work so far, team!",
+                "Anyone need mana or buffs before we move?"
+            }
+            local msg = prompts[math.random(#prompts)]
+            SendChatMessage(msg, "PARTY")
+          end },
+        { id = "whisper_bot", icon = "Interface\\Icons\\INV_Misc_QuestionMark", title = "Whisper Companion",
+          desc = "Whisper your targeted companion bot to trigger an AI response.",
+          onClick = function()
+            local target = UnitName("target")
+            if target and UnitIsPlayer("target") and not UnitIsEnemy("target", "player") then
+                local prompts = {
+                    "What's on your mind?",
+                    "How are you holding up?",
+                    "What do you think of our setup right now?",
+                    "Need anything?"
+                }
+                local msg = prompts[math.random(#prompts)]
+                SendChatMessage(msg, "WHISPER", nil, target)
+            else
+                UIErrorsFrame:AddMessage("Target a friendly companion bot first!", 1.0, 0.1, 0.1, 1.0)
+            end
+          end },
+        { id = "rebuff", icon = "Interface\\Icons\\Spell_Holy_MagicalSentry", title = "Rebuff Party",
+          desc = "Order party bots to refresh missing class buffs.",
+          onClick = function() NS.CB_SendGroupCommand("rebuff") end },
+        { id = "autogear", icon = "Interface\\Icons\\INV_Chest_Plate03", title = "Autogear",
+          desc = "Order party bots to equip optimal gear upgrades.",
+          onClick = function() NS.CB_SendGroupCommand("autogear") end },
+    } },
+}
+NS.CB_actionSlots = SLOTS   -- exposed so the Settings panel can render the enable/disable list
+
+-- ── Shift-drag reorder (slots on the bar, children within an open flyout) ────
+-- Flow axis + direction sign per grow/flyout direction: which screen axis the buttons run along, and
+-- whether flow order increases (+1) or decreases (-1) that coordinate.
+local DIR_AXIS = { RIGHT = { "x", 1 }, LEFT = { "x", -1 }, DOWN = { "y", -1 }, UP = { "y", 1 } }
+
+-- Moves `id` within `order` so that, among ENABLED entries (isOff(x) == falsey), it lands at visible
+-- position `visIdx` (1-based). Disabled entries keep their relative spot. Pure (given isOff). Exposed
+-- for specs.
+local function CB_MoveToVisibleIndex(order, isOff, id, visIdx)
+    local rest = {}
+    for _, x in ipairs(order) do if x ~= id then rest[#rest + 1] = x end end
+    local enabledSeen, insertAt = 0, #rest + 1
+    for i, x in ipairs(rest) do
+        if not isOff(x) then
+            enabledSeen = enabledSeen + 1
+            if enabledSeen == visIdx then insertAt = i; break end
+        end
+    end
+    table.insert(rest, insertAt, id)
+    return rest
+end
+NS.CB_MoveToVisibleIndex = CB_MoveToVisibleIndex
+
+local reorderState           -- { kind, id, slotId?, axis, sign, buttons, dragged, flyoutBtn?, wasPinned?, vis }
+local reorderGhost, reorderLine
+
+local function ensureReorderFrames()
+    if reorderGhost then return end
+    reorderGhost = CreateFrame("Frame", "CleanBotReorderGhost", UIParent)
+    reorderGhost:SetFrameStrata("TOOLTIP")
+    reorderGhost:SetSize(BTN, BTN)
+    reorderGhost:SetAlpha(0.7)
+    reorderGhost.icon = reorderGhost:CreateTexture(nil, "OVERLAY")
+    reorderGhost.icon:SetAllPoints()
+    reorderGhost:Hide()
+
+    reorderLine = CreateFrame("Frame", "CleanBotReorderLine", UIParent)
+    reorderLine:SetFrameStrata("TOOLTIP")
+    local lt = reorderLine:CreateTexture(nil, "OVERLAY")
+    lt:SetAllPoints()
+    lt:SetTexture(0.2, 0.6, 1.0, 0.95)   -- blue insertion line
+    reorderLine:Hide()
+end
+
+-- Positions the insertion line in the gap before the vis-th remaining (non-dragged) button, or after
+-- the last one. Vertical line for a horizontal flow, horizontal line for a vertical flow.
+local function updateReorderLine(vis)
+    local rem = {}
+    for _, b in ipairs(reorderState.buttons) do
+        if b ~= reorderState.dragged and b:IsShown() and b:GetLeft() then rem[#rem + 1] = b end
+    end
+    if #rem == 0 then reorderLine:Hide() return end
+    local axis, sign = reorderState.axis, reorderState.sign
+    local before     = vis <= #rem
+    local ref        = before and rem[vis] or rem[#rem]
+    local nudge      = (GAP / 2) * (before and 1 or -1)
+    reorderLine:ClearAllPoints()
+    if axis == "x" then
+        local edge = before and ((sign > 0) and ref:GetLeft() or ref:GetRight())
+                            or  ((sign > 0) and ref:GetRight() or ref:GetLeft())
+        reorderLine:SetSize(2, BTN)
+        reorderLine:SetPoint("CENTER", UIParent, "BOTTOMLEFT", edge - sign * nudge, ref:GetBottom() + ref:GetHeight() / 2)
+    else
+        local edge = before and ((sign > 0) and ref:GetBottom() or ref:GetTop())
+                            or  ((sign > 0) and ref:GetTop() or ref:GetBottom())
+        reorderLine:SetSize(BTN, 2)
+        reorderLine:SetPoint("CENTER", UIParent, "BOTTOMLEFT", ref:GetLeft() + ref:GetWidth() / 2, edge - sign * nudge)
+    end
+    reorderLine:Show()
+end
+
+-- Per-frame while dragging: follow the cursor with the ghost, recompute the visible insertion index
+-- from the cursor's position along the flow axis, and move the indicator line.
+local function reorderUpdate()
+    if not reorderState then return end
+    local scale  = UIParent:GetEffectiveScale()
+    local cx, cy = GetCursorPosition()
+    cx, cy = cx / scale, cy / scale
+    reorderGhost:ClearAllPoints()
+    reorderGhost:SetPoint("CENTER", UIParent, "BOTTOMLEFT", cx, cy)
+
+    local pos = (reorderState.axis == "x") and cx or cy
+    local vis = 1
+    for _, b in ipairs(reorderState.buttons) do
+        if b ~= reorderState.dragged and b:IsShown() and b:GetLeft() then
+            local c = (reorderState.axis == "x") and (b:GetLeft() + b:GetWidth() / 2)
+                                                  or  (b:GetBottom() + b:GetHeight() / 2)
+            if (reorderState.sign > 0 and pos > c) or (reorderState.sign < 0 and pos < c) then vis = vis + 1 end
+        end
+    end
+    reorderState.vis = vis
+    updateReorderLine(vis)
+end
+
+local function finishReorder()
+    if not reorderState then return end
+    local st = reorderState
+    reorderState = nil
+    reorderGhost:SetScript("OnUpdate", nil)
+    reorderGhost:Hide()
+    reorderLine:Hide()
+    st.dragged:SetAlpha(1)
+    if st.kind == "slot" then
+        barLayout.slotOrder = CB_MoveToVisibleIndex(barLayout.slotOrder,
+            function(x) return barLayout.slotOff[x] end, st.id, st.vis)
+    else
+        local sid = st.slotId
+        barLayout.childOrder[sid] = CB_MoveToVisibleIndex(barLayout.childOrder[sid] or {},
+            function(x) return barLayout.childOff[sid .. "." .. x] end, st.id, st.vis)
+        if st.flyoutBtn then st.flyoutBtn.flyout.pinned = st.wasPinned end
+    end
+    NS.CB_SaveLayout()
+    NS.CB_RebuildBar()
+    if NS.CB_RefreshActionBarButtonList then NS.CB_RefreshActionBarButtonList() end
+end
+
+-- Begins a reorder drag for `btn` (a slot button or a flyout child). buttons = the live ordered+visible
+-- set it moves within; axis/sign come from the bar's grow direction (slots) or the flyout's flow (children).
+local function beginReorder(btn, kind, slotId, childId)
+    if reorderState then return end
+    ensureReorderFrames()
+    local axis, sign, buttons, flyoutBtn, wasPinned
+    if kind == "slot" then
+        local da = DIR_AXIS[anchor.growDir] or DIR_AXIS.RIGHT
+        axis, sign, buttons = da[1], da[2], barButtons
+    else
+        flyoutBtn = slotBtns[slotId]
+        local da  = DIR_AXIS[flyoutBtn.flyout._dir or "DOWN"] or DIR_AXIS.DOWN
+        axis, sign = da[1], da[2]
+        -- Include the host as the first position so a child dragged to the front becomes the main.
+        buttons = { flyoutBtn }
+        for _, c in ipairs(flyoutBtn.children) do buttons[#buttons + 1] = c end
+        wasPinned = flyoutBtn.flyout.pinned
+        flyoutBtn.flyout.pinned = true   -- keep it open while dragging within it
+    end
+    reorderState = { kind = kind, id = childId or slotId, slotId = slotId, axis = axis, sign = sign,
+                     buttons = buttons, dragged = btn, flyoutBtn = flyoutBtn, wasPinned = wasPinned, vis = 1 }
+    btn:SetAlpha(0.3)
+    reorderGhost.icon:SetTexture(btn.icon and btn.icon:GetTexture())
+    reorderGhost:Show()
+    reorderGhost:SetScript("OnUpdate", reorderUpdate)
+    reorderUpdate()
+end
+
+-- Wires shift-drag reorder onto one button (a slot or a flyout child). Plain click still fires (a drag
+-- only starts past WoW's drag threshold); non-shift drags are ignored.
+local function wireReorder(btn, kind, slotId)
+    btn:RegisterForDrag("LeftButton")
+    btn:SetScript("OnDragStart", function(self)
+        -- For a child, its displayed action id (self._actionId) is read live (it changes on reorder).
+        if IsShiftKeyDown() then beginReorder(self, kind, slotId, self._actionId) end
+    end)
+    btn:SetScript("OnDragStop", finishReorder)
+end
+
+-- Creates every slot button + flyout child ONCE from the registry (no order/visibility logic — that's
+-- CB_RebuildBar). Frames can't be destroyed in 3.3.5a, so we pre-create the full set and only
+-- show/hide/reorder afterward.
+local function CB_BuildButtons()
+    for _, s in ipairs(SLOTS) do
+        local btn
+        if s.nested then
+            -- Generated nested flyout (the Recruit tree). The tree itself isn't reorderable (its nodes
+            -- get no wireReorder), but the main button reorders on the bar like any other slot.
+            btn = CB_CreateRecruitButton(bar, s.frame)
+            wireReorder(btn, "slot", s.id)
+        elseif #s.actions > 1 then
+            btn = CB_CreateFlyoutButton(bar, s.frame)
+            for _, a in ipairs(s.actions) do btn._actionsById[a.id] = a end
+            -- One fewer child frame than actions (one action is always the main on the host).
+            for i = 1, #s.actions - 1 do
+                wireReorder(btn:AddChildSlot(i), "child", s.id)
+            end
+            wireReorder(btn, "slot", s.id)
+        else
+            local a = s.actions[1]
+            btn = NS.CB_CreateIconButton(bar, s.frame, a.icon, BTN, a.onClick)
+            NS.CB_SetTooltip(btn, a.title, a.desc)
+            wireReorder(btn, "slot", s.id)
+        end
+        slotBtns[s.id] = btn
+        if s.refresh then NS.commandRefreshers[#NS.commandRefreshers + 1] = s.refresh end
+    end
+end
+
+-- Merges the saved layout (CleanBot_SavedVars.actionBarLayout) with the registry defaults into barLayout.
+local function CB_LoadLayout()
+    local saved = (CleanBot_SavedVars and CleanBot_SavedVars.actionBarLayout) or {}
+    local defSlots = {}
+    for _, s in ipairs(SLOTS) do defSlots[#defSlots + 1] = s.id end
+    barLayout.slotOrder  = NS.CB_MergeOrder(defSlots, saved.slotOrder)
+    barLayout.childOrder = {}
+    for _, s in ipairs(SLOTS) do
+        if #s.actions > 1 then
+            local defActions = {}
+            for _, a in ipairs(s.actions) do defActions[#defActions + 1] = a.id end
+            local sc = saved.childOrder and saved.childOrder[s.id]
+            -- Migration: a pre-unification save lists only the flyout children (no main action id), which
+            -- would wrongly make a flyout item the main. If the save lacks the default main, reset to default.
+            local hasMain = false
+            if sc then for _, x in ipairs(sc) do if x == defActions[1] then hasMain = true break end end end
+            barLayout.childOrder[s.id] = hasMain and NS.CB_MergeOrder(defActions, sc) or defActions
+        end
+    end
+    barLayout.slotOff, barLayout.childOff = {}, {}
+    if type(saved.slotOff)  == "table" then for k, v in pairs(saved.slotOff)  do if v then barLayout.slotOff[k]  = true end end end
+    if type(saved.childOff) == "table" then for k, v in pairs(saved.childOff) do if v then barLayout.childOff[k] = true end end end
+end
+
+local function CB_SaveLayout()
+    if CleanBot_SavedVars then
+        CleanBot_SavedVars.actionBarLayout = {
+            slotOrder = barLayout.slotOrder, slotOff = barLayout.slotOff,
+            childOrder = barLayout.childOrder, childOff = barLayout.childOff,
+        }
+    end
+end
+NS.CB_SaveLayout = CB_SaveLayout
+NS.CB_actionBarLayout = barLayout   -- exposed so the config panel reads/writes order + enabled state
+
+-- Applies barLayout to the (already-created) buttons: builds barButtons from the enabled slots in order,
+-- hides disabled slots, sets each flyout's active child subset, then lays the bar out. No frame creation.
+local function CB_RebuildBar()
+    if not bar then return end
+    barButtons = {}
+    for _, id in ipairs(barLayout.slotOrder) do
+        local b = slotBtns[id]
+        if b then
+            local visible = not barLayout.slotOff[id]
+            if b.SetActiveOrder then   -- multi-action flyout slot: assign enabled actions; hide if none
+                local enabled = {}
+                for _, aid in ipairs(barLayout.childOrder[id] or {}) do
+                    if not barLayout.childOff[id .. "." .. aid] then enabled[#enabled + 1] = aid end
+                end
+                b:SetActiveOrder(enabled)
+                visible = visible and #enabled > 0
+            end
+            if visible then b:Show(); barButtons[#barButtons + 1] = b else b:Hide() end
+        end
+    end
+    CB_LayoutBar()
+end
+NS.CB_RebuildBar = CB_RebuildBar
+
+-- Enable/disable accessors for the Settings-tab list. Getters default to enabled; setters mutate
+-- barLayout, persist, and rebuild the bar live. childOff is keyed "slotId.childId".
+NS.CB_IsSlotEnabled  = function(id)            return not barLayout.slotOff[id] end
+NS.CB_IsChildEnabled = function(slotId, cid)   return not barLayout.childOff[slotId .. "." .. cid] end
+NS.CB_SetSlotEnabled = function(id, on)
+    barLayout.slotOff[id] = (not on) or nil
+    CB_SaveLayout(); CB_RebuildBar()
+end
+NS.CB_SetChildEnabled = function(slotId, cid, on)
+    barLayout.childOff[slotId .. "." .. cid] = (not on) or nil
+    CB_SaveLayout(); CB_RebuildBar()
+end
+
+-- ── Build (once, at PLAYER_LOGIN) ────────────────────────────────────────────
+local function CB_BuildActionBar()
+    bar = CreateFrame("Frame", "CleanBotActionBarFrame", UIParent)
+    bar:SetFrameStrata("MEDIUM")
+    bar:SetClampedToScreen(true)
+    bar:Hide()
+    NS.CB_ApplyFrameSkin(bar, 2)
+
+    -- Create every slot button + flyout child once from the registry (order/visibility applied later
+    -- by CB_RebuildBar). Refreshers (Passive / Movement saturation) are registered here.
+    CB_BuildButtons()
+
+    -- Combat transitions re-flow the displayed movement context (combat vs non-combat); combat END
+    -- triggers the pending Runaway revert.
+    local moveCombatFrame = CreateFrame("Frame", "CleanBotActionMoveCombatFrame")
+    moveCombatFrame:RegisterEvent("PLAYER_REGEN_ENABLED")
+    moveCombatFrame:RegisterEvent("PLAYER_REGEN_DISABLED")
+    moveCombatFrame:SetScript("OnEvent", function(_, ev)
+        if ev == "PLAYER_REGEN_ENABLED" then revertRunaway() end
+        refreshMoveBtns()
+    end)
+
+    -- Edit overlay: covers the bar above the buttons, mouse-enabled only in edit mode, so it
+    -- both blocks button clicks ("disables normal interaction") and is the drag handle.
+    overlay = CreateFrame("Frame", nil, bar)
+    overlay:SetAllPoints(bar)
+    overlay:SetFrameLevel(bar:GetFrameLevel() + 10)
+    overlay:EnableMouse(true)
+    overlay:Hide()
+
+    local tint = overlay:CreateTexture(nil, "OVERLAY")
+    tint:SetAllPoints(overlay)
+    tint:SetTexture(0.1, 0.6, 1.0, 0.25)   -- translucent blue "edit" wash
+
+    local editLabel = overlay:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+    editLabel:SetPoint("CENTER", overlay, "CENTER", 0, 0)
+    editLabel:SetText("CleanBot")
+
+    NS.CB_SetTooltip(overlay, "Action Bar — Edit Mode",
+        "Click and drag to move. Drag near a frame (minimap, the CleanBot window, a unit frame, …) to snap to its edge.", "ANCHOR_TOP")
+
+    -- Drag starts on mouse-down (immediate) — fine since this only fires in edit mode.
+    overlay:SetScript("OnMouseDown", function(_, button)
+        if button == "LeftButton" then CB_BeginDrag() end
+    end)
+    overlay:SetScript("OnMouseUp", function(_, button)
+        if button == "LeftButton" then CB_FinishDrag() end
+    end)
+
+    -- Snap highlight: a green wash laid over whatever frame the bar is currently snapped to during a
+    -- drag, so the anchor target is obvious. High strata so it shows above the candidate frame.
+    snapHighlight = CreateFrame("Frame", "CleanBotSnapHighlightFrame", UIParent)
+    snapHighlight:SetFrameStrata("FULLSCREEN_DIALOG")
+    snapHighlight:Hide()
+    local hlTint = snapHighlight:CreateTexture(nil, "ARTWORK")
+    hlTint:SetAllPoints(snapHighlight)
+    hlTint:SetTexture(0.1, 1.0, 0.1, 0.25)   -- translucent green "snapped here" wash
+    local hlEdge = snapHighlight:CreateTexture(nil, "OVERLAY")
+    hlEdge:SetTexture(0.2, 0.6, 1.0, 0.9)    -- bright blue strip on the snapped edge
+    snapHighlight.edge = hlEdge
+    local hlLabel = snapHighlight:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+    hlLabel:SetPoint("CENTER", snapHighlight, "CENTER", 0, 0)
+    snapHighlight.label = hlLabel
+
+    CB_BuildConfig()
+
+    -- ── Restore position + shown state (edit mode always starts off). ──
+    -- Seed the anchor model from SavedVars. Pre-grow-from saves stored point/relPoint = BOTTOMLEFT, so
+    -- their x/y are valid BOTTOMLEFT offsets and the default growFrom = BOTTOMLEFT reproduces them.
+    local a = CleanBot_SavedVars and CleanBot_SavedVars.actionBarAnchor
+    if type(a) == "table" then
+        anchor.relTo    = a.relTo or "UIParent"
+        anchor.growFrom = (a.growFrom and CORNER_LABEL[a.growFrom] and a.growFrom) or a.point or "BOTTOMLEFT"
+        anchor.x        = a.x or 0
+        anchor.y        = a.y or 0
+        anchor.growDir  = (a.growDir and DIR_LABEL[a.growDir] and a.growDir) or "RIGHT"
+    end
+    CB_LoadLayout()  -- merge persisted button order + enabled state with the registry
+    CB_RebuildBar()  -- build barButtons + flyout child subsets, then lay out (replaces CB_LayoutBar)
+    if NS.CB_RefreshActionBarButtonList then NS.CB_RefreshActionBarButtonList() end  -- sync Settings checkboxes
+    CB_ApplyAnchor()
+    -- Snapping defaults ON; only an explicit saved false disables it.
+    NS.actionBarSnap = not (CleanBot_SavedVars and CleanBot_SavedVars.actionBarSnap == false)
+    CB_RefreshConfig()
+    NS.actionBarShown = CleanBot_SavedVars and CleanBot_SavedVars.actionBarShown == true
+    applyVisibility()
+    refreshPassiveBtn()
+    refreshMoveBtns()
+    if NS.CB_RefreshActionBarChecks then NS.CB_RefreshActionBarChecks() end
+end
+
+-- Build on PLAYER_ENTERING_WORLD (once): by then ElvUI's frames + skin module are fully initialized
+-- and saved anchor targets (e.g. ElvUF_Player) exist — so the icons crop and the bar restores onto
+-- its anchored frame correctly. PLAYER_LOGIN is too early for both (other addons' frames may not be
+-- up yet). CleanBot's own frames (CB_BuildFrames) are built by login, so they're ready here too.
+local loader = CreateFrame("Frame")
+loader:RegisterEvent("PLAYER_ENTERING_WORLD")
+loader:SetScript("OnEvent", function(self)
+    self:UnregisterEvent("PLAYER_ENTERING_WORLD")
+    CB_BuildActionBar()
+end)

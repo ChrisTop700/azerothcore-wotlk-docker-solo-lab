@@ -1,0 +1,1123 @@
+-- ============================================================
+-- SettingsTab.lua  —  Settings tab panel construction and content
+--
+-- Two nested sub-tabs inside the Settings panel:
+--   • Theme   — scale, transparency, accent color
+--   • Layout  — margin tuning and the Sample Layout launcher
+--
+-- The Sample Layout window is a standalone singleton floating
+-- frame that shows one of every widget type with debug overlays.
+-- ============================================================
+local NS = CleanBotNS
+
+-- ============================================================
+-- Sample Layout window
+-- ============================================================
+
+local overlayFrames  = {}
+local overlayVisible = true
+
+-- Visualises the margin space around a widget. Green = positive margin, red = negative.
+-- These frames intentionally bypass the CB_AnchorBelow / CB_AnchorAhead helpers and the
+-- margin/padding model entirely — using those helpers would be circular, since the gaps
+-- they produce are derived from the very margin values being visualised here. Raw SetPoint
+-- against specific reference frames is the only correct approach.
+---@param parent table  Frame the debug overlay is anchored to.
+---@param widget table  The widget being annotated with its debug overlay.
+local function applyDebugOverlay(parent, widget)
+    local mTop    = widget.marginTop    or 0
+    local mBottom = widget.marginBottom or 0
+    local mLeft   = widget.marginLeft   or 0
+    local mRight  = widget.marginRight  or 0
+    local level   = parent:GetFrameLevel() + 20
+
+    local function makeOverlay(r, g, b)
+        local f = CreateFrame("Frame", nil, parent)
+        f:SetFrameLevel(level)
+        local tex = f:CreateTexture(nil, "OVERLAY")
+        tex:SetAllPoints()
+        tex:SetTexture("Interface\\ChatFrame\\ChatFrameBackground")
+        tex:SetVertexColor(r, g, b, 0.2)
+        overlayFrames[#overlayFrames + 1] = f
+        if not overlayVisible then f:Hide() end
+        return f
+    end
+
+    -- Top/bottom: show this widget's contribution to the gap above/below it.
+    -- Height = the margin value; anchored flush to the widget's top or bottom edge.
+    if mTop ~= 0 then
+        local top = mTop > 0 and makeOverlay(0, 1, 0) or makeOverlay(1, 0, 0)
+        top:SetPoint("BOTTOMLEFT",  widget, "TOPLEFT",  0, 0)
+        top:SetPoint("BOTTOMRIGHT", widget, "TOPRIGHT", 0, 0)
+        top:SetHeight(math.abs(mTop))
+    end
+
+    if mBottom ~= 0 then
+        local bot = mBottom > 0 and makeOverlay(0, 1, 0) or makeOverlay(1, 0, 0)
+        bot:SetPoint("TOPLEFT",  widget, "BOTTOMLEFT",  0, 0)
+        bot:SetPoint("TOPRIGHT", widget, "BOTTOMRIGHT", 0, 0)
+        bot:SetHeight(math.abs(mBottom))
+    end
+
+    -- Left: CSS-style — spans between the parent's content left edge (parent.paddingLeft)
+    -- and the widget's left edge. For positive marginLeft the widget sits to the right of
+    -- the content edge; for negative it encroaches into the padding, so the span reverses.
+    if mLeft ~= 0 then
+        local left = mLeft > 0 and makeOverlay(0, 1, 0) or makeOverlay(1, 0, 0)
+        if mLeft > 0 then
+            left:SetPoint("TOPRIGHT",    widget, "TOPLEFT",    0, 0)
+            left:SetPoint("BOTTOMRIGHT", widget, "BOTTOMLEFT", 0, 0)
+            left:SetPoint("LEFT",        parent, "LEFT",       (parent.paddingLeft or 0), 0)
+        else
+            left:SetPoint("TOPLEFT",    widget, "TOPLEFT",    0, 0)
+            left:SetPoint("BOTTOMLEFT", widget, "BOTTOMLEFT", 0, 0)
+            left:SetPoint("RIGHT",      parent, "LEFT",       (parent.paddingLeft or 0), 0)
+        end
+    end
+
+    -- Right: marginRight has no parent-wall reference in vertical flow (it is only the
+    -- right half of the gap in CB_AnchorAhead). Show reserved space to the right of the
+    -- widget by the margin amount — the most accurate representation in both flow contexts.
+    if mRight ~= 0 then
+        local right = mRight > 0 and makeOverlay(0, 1, 0) or makeOverlay(1, 0, 0)
+        right:SetPoint("TOPLEFT",    widget, "TOPRIGHT",    0, 0)
+        right:SetPoint("BOTTOMLEFT", widget, "BOTTOMRIGHT", 0, 0)
+        right:SetWidth(math.abs(mRight))
+    end
+end
+
+-- Visualises the padding insets of a frame. Blue overlays mark each of the 4 padding strips.
+-- Same intentional raw-SetPoint bypass as applyDebugOverlay — these exist to show
+-- the padding space, not participate in it.
+---@param frame table  Frame to draw the padding-visualisation overlay on.
+local function applyPaddingOverlay(frame)
+    local pTop    = frame.paddingTop    or 0
+    local pBottom = frame.paddingBottom or 0
+    local pLeft   = frame.paddingLeft   or 0
+    local pRight  = frame.paddingRight  or 0
+    local level   = frame:GetFrameLevel() + 10
+
+    local function makePad()
+        local f = CreateFrame("Frame", nil, frame)
+        f:SetFrameLevel(level)
+        local tex = f:CreateTexture(nil, "OVERLAY")
+        tex:SetAllPoints()
+        tex:SetTexture("Interface\\ChatFrame\\ChatFrameBackground")
+        tex:SetVertexColor(0, 0.5, 1, 0.25)
+        overlayFrames[#overlayFrames + 1] = f
+        if not overlayVisible then f:Hide() end
+        return f
+    end
+
+    if pTop ~= 0 then
+        local top = makePad()
+        top:SetPoint("TOPLEFT",  frame, "TOPLEFT",  0, 0)
+        top:SetPoint("TOPRIGHT", frame, "TOPRIGHT", 0, 0)
+        top:SetHeight(pTop)
+    end
+
+    if pBottom ~= 0 then
+        local bot = makePad()
+        bot:SetPoint("BOTTOMLEFT",  frame, "BOTTOMLEFT",  0, 0)
+        bot:SetPoint("BOTTOMRIGHT", frame, "BOTTOMRIGHT", 0, 0)
+        bot:SetHeight(pBottom)
+    end
+
+    if pLeft ~= 0 then
+        local left = makePad()
+        left:SetPoint("TOPLEFT",    frame, "TOPLEFT",    0, 0)
+        left:SetPoint("BOTTOMLEFT", frame, "BOTTOMLEFT", 0, 0)
+        left:SetWidth(pLeft)
+    end
+
+    if pRight ~= 0 then
+        local right = makePad()
+        right:SetPoint("TOPRIGHT",    frame, "TOPRIGHT",    0, 0)
+        right:SetPoint("BOTTOMRIGHT", frame, "BOTTOMRIGHT", 0, 0)
+        right:SetWidth(pRight)
+    end
+end
+
+local sampleSection  = nil
+local sampleGenCount = 0
+
+-- Tears down the previous section and rebuilds inside 'panel'.
+-- The section demonstrates section padding; widgets inside it demonstrate margins.
+---@param panel table  The sample-layout panel to populate with demo widgets.
+local function buildSampleContent(panel)
+    if sampleSection then sampleSection:Hide() end
+    for _, f in ipairs(overlayFrames) do f:Hide() end
+    overlayFrames  = {}
+    sampleGenCount = sampleGenCount + 1
+    local gen = sampleGenCount
+
+    applyPaddingOverlay(panel)
+
+    -- Section sits inside the panel, inset by panel padding.
+    -- Leaves room at the bottom for the persistent "Show Overlays" checkbox row.
+    -- Row height = section bottom padding + checkbox margins + checkbox height + panel bottom padding.
+    local OVERLAY_ROW_H = NS.PADDING.section.bottom + NS.MARGIN.checkbox.bottom + panel._overlayCB:GetHeight() + NS.MARGIN.checkbox.top + (panel.paddingBottom or 0)
+    local section = NS.CB_CreatePanel(panel, nil, 4, "section")
+    section:SetPoint("TOPLEFT",     panel, "TOPLEFT",      (panel.paddingLeft  or 0), -(panel.paddingTop   or 0))
+    section:SetPoint("BOTTOMRIGHT", panel, "BOTTOMRIGHT", -(panel.paddingRight or 0),   OVERLAY_ROW_H)
+    sampleSection = section
+    applyPaddingOverlay(section)
+
+    -- First widget: section padding + the widget's own marginTop are both applied
+    -- explicitly so the header's top margin is visible when tuning in Settings.
+    local header = NS.CB_CreateHeader(section, "Lorem Ipsum")
+    header:SetPoint("TOPLEFT", section, "TOPLEFT",
+        (section.paddingLeft or 0) + (header.marginLeft or 0),
+        -((section.paddingTop or 0) + (header.marginTop or 0)))
+    applyDebugOverlay(section, header)
+
+    local lbl = NS.CB_CreateLabel(section, "Lorem Ipsum")
+    NS.CB_AnchorBelow(lbl, header)
+    applyDebugOverlay(section, lbl)
+
+    local btn = NS.CB_CreateButton(section, nil, "Lorem Ipsum", 120, 22)
+    NS.CB_AnchorBelow(btn, lbl)
+    applyDebugOverlay(section, btn)
+
+    local chk = NS.CB_CreateCheckBox(section, nil)
+    NS.CB_AnchorBelow(chk, btn)
+    applyDebugOverlay(section, chk)
+    local chkLbl = NS.CB_CreateLabel(section, "Lorem Ipsum")
+    chkLbl:SetPoint("LEFT", chk, "RIGHT", 2, 0)
+    chkLbl.marginTop    = 0
+    chkLbl.marginBottom = 0
+    applyDebugOverlay(section, chkLbl)
+
+    local eb = NS.CB_CreateEditBox(section, nil, 180, 20)
+    NS.CB_AnchorBelow(eb, chk)
+    eb:SetText("Lorem Ipsum")
+    eb:SetAutoFocus(false)
+    applyDebugOverlay(section, eb)
+
+    local dd = NS.CB_CreateDropdown(section, "CleanBotSampleDropdown" .. gen, 150)
+    NS.CB_AnchorBelow(dd, eb)
+    UIDropDownMenu_Initialize(dd, function()
+        local info = UIDropDownMenu_CreateInfo()
+        info.text  = "Lorem Ipsum"
+        info.value = 1
+        info.func  = function() UIDropDownMenu_SetSelectedValue(dd, 1) end
+        UIDropDownMenu_AddButton(info)
+    end)
+    UIDropDownMenu_SetText(dd, "Lorem Ipsum")
+    applyDebugOverlay(section, dd)
+
+    local sl = NS.CB_CreateSlider(section, "CleanBotSampleSlider" .. gen,
+        "Lorem Ipsum", 0, 100, 50, "0", "100", nil)
+    sl:SetWidth(200)
+    NS.CB_AnchorBelow(sl, dd)
+    applyDebugOverlay(section, sl)
+
+    local sw = NS.CB_CreateColorSwatch(section, nil, "Lorem Ipsum", 1, 0.5, 0)
+    NS.CB_AnchorBelow(sw, sl)
+    applyDebugOverlay(section, sw)
+end
+
+-- Opens the singleton Sample Layout window, creating it on first call.
+local sampleLayoutFrame = nil
+
+--- Opens (creating once) the sample-layout preview window used to tune spacing.
+local function showSampleLayout()
+    if sampleLayoutFrame and sampleLayoutFrame:IsShown() then
+        sampleLayoutFrame:Hide()
+        return
+    end
+
+    if not sampleLayoutFrame then
+        local f = CreateFrame("Frame", "CleanBotSampleLayoutFrame", UIParent)
+        NS.CB_RegisterRootFrame(f)
+        f:SetSize(380, NS.FRAME_HEIGHT)
+        f:SetPoint("TOPLEFT", CleanBotFrame, "TOPRIGHT", 4, 0)
+        f:SetFrameStrata("DIALOG")
+        f:SetMovable(true)
+        f:EnableMouse(true)
+        f:RegisterForDrag("LeftButton")
+        f:SetScript("OnDragStart", f.StartMoving)
+        f:SetScript("OnDragStop",  f.StopMovingOrSizing)
+        if NS.ElvUI_S then f:StripTextures() end
+        NS.CB_ApplyFrameSkin(f, 0)
+        NS.CB_ApplyTitleBar(f, "Sample Layout")
+
+        -- Stamp padding fields — f is a raw CreateFrame so CB_CreatePanel never runs on it.
+        local framePad = NS.PADDING.frame
+        f.paddingTop    = framePad.top
+        f.paddingBottom = framePad.bottom
+        f.paddingLeft   = framePad.left
+        f.paddingRight  = framePad.right
+
+        local closeBtn = CreateFrame("Button", "CleanBotSampleLayoutClose", f, "UIPanelCloseButton")
+        closeBtn:SetPoint("TOPRIGHT", f, "TOPRIGHT", 2, 2)
+        closeBtn:SetScript("OnClick", function() f:Hide() end)
+        if NS.ElvUI_S then NS.ElvUI_S:HandleCloseButton(closeBtn) end
+
+        -- Panel — level 2, mirrors managePanel/individualPanel inside CleanBotFrame.
+        local panel = NS.CB_CreatePanel(f, "CleanBotSamplePanel", 2, "panel")
+        panel:SetPoint("TOPLEFT",     f, "TOPLEFT",      f.paddingLeft,   -NS.TITLE_H)
+        panel:SetPoint("BOTTOMRIGHT", f, "BOTTOMRIGHT", -f.paddingRight,   f.paddingBottom)
+        f._panel = panel
+
+        -- "Show Overlays" checkbox lives on the panel outside the rebuilt section.
+        -- Stored on the panel so buildSampleContent can query its height for OVERLAY_ROW_H.
+        local overlayCB = NS.CB_CreateCheckBox(panel, "CleanBotSampleLayoutOverlayCB")
+        panel._overlayCB = overlayCB
+        overlayCB:SetChecked(overlayVisible)
+        overlayCB:SetPoint("BOTTOMLEFT", panel, "BOTTOMLEFT",
+            (panel.paddingLeft   or 0) + (overlayCB.marginLeft   or 0),
+            (panel.paddingBottom or 0) + (overlayCB.marginBottom or 0))
+        local overlayCBLbl = NS.CB_CreateLabel(panel, "Show Overlays")
+        overlayCBLbl:SetPoint("LEFT", overlayCB, "RIGHT", 2, 0)
+        overlayCB:SetScript("OnClick", function(self)
+            local checked = self:GetChecked() and true or false
+            self:SetChecked(checked)
+            overlayVisible = checked
+            for _, overlay in ipairs(overlayFrames) do
+                if checked then overlay:Show() else overlay:Hide() end
+            end
+        end)
+
+        CleanBotFrame:HookScript("OnHide", function()
+            if sampleLayoutFrame then sampleLayoutFrame:Hide() end
+        end)
+
+        sampleLayoutFrame = f
+    end
+
+    sampleLayoutFrame:ClearAllPoints()
+    sampleLayoutFrame:SetPoint("TOPLEFT", CleanBotFrame, "TOPRIGHT", 4, 0)
+    buildSampleContent(sampleLayoutFrame._panel)
+    sampleLayoutFrame:Show()
+end
+
+-- ============================================================
+-- Settings tab
+-- ============================================================
+
+--- Builds the Settings tab: the nested sub-tabs and all their option widgets.
+NS.CleanBot_BuildSettingsTab = function()
+    NS.settingsPanel = NS.CB_CreatePanel(NS.contentFrame, "CleanBotSettingsPanel", 2, "panel")
+    NS.settingsPanel:SetAllPoints(NS.contentFrame)
+    NS.settingsPanel:Hide()
+
+    local panel    = NS.settingsPanel
+    local SLIDER_W = 130
+
+    local SUB_TAB_H = NS.TOP_BAR_H
+    -- Forward declarations — both are defined later but called only at interaction time.
+    local syncPendingToUI
+    local syncApplyBtn
+
+    -- ── Pending values ─────────────────────────────────────────
+    local pendingScale        = NS.scale
+    local pendingTransparency = NS.transparency
+    local pendingAccentR      = NS.accentColor.r
+    local pendingAccentG      = NS.accentColor.g
+    local pendingAccentB      = NS.accentColor.b
+    local pendingAccentA      = NS.accentColor.a
+
+    local pendingMargins = {}
+    for k, v in pairs(NS.MARGIN) do
+        pendingMargins[k] = { top = v.top, bottom = v.bottom, left = v.left, right = v.right }
+    end
+
+    local pendingPadding = {}
+    for k, v in pairs(NS.PADDING) do
+        pendingPadding[k] = { top = v.top, bottom = v.bottom, left = v.left, right = v.right }
+    end
+
+    -- ── Action buttons ─────────────────────────────────────────
+    -- Created first so BTN_ROW_H can query the actual rendered height.
+    local defaultsBtn = NS.CB_CreateButton(panel, "CleanBotDefaultsSettings", "Defaults", 80, 22, function()
+        pendingScale        = NS.THEME_DEFAULTS.scale
+        pendingTransparency = NS.THEME_DEFAULTS.transparency
+        pendingAccentR      = NS.THEME_DEFAULTS.accentColor.r
+        pendingAccentG      = NS.THEME_DEFAULTS.accentColor.g
+        pendingAccentB      = NS.THEME_DEFAULTS.accentColor.b
+        pendingAccentA      = NS.THEME_DEFAULTS.accentColor.a
+        for k, defaults in pairs(NS.MARGIN_DEFAULTS) do
+            pendingMargins[k].top    = defaults.top
+            pendingMargins[k].bottom = defaults.bottom
+            pendingMargins[k].left   = defaults.left
+            pendingMargins[k].right  = defaults.right
+        end
+        for k, defaults in pairs(NS.PADDING_DEFAULTS) do
+            pendingPadding[k].top    = defaults.top
+            pendingPadding[k].bottom = defaults.bottom
+            pendingPadding[k].left   = defaults.left
+            pendingPadding[k].right  = defaults.right
+        end
+        syncPendingToUI()
+    end)
+    NS.CB_AnchorWall(defaultsBtn, panel, "BOTTOMLEFT")
+
+    local cancelBtn = NS.CB_CreateButton(panel, "CleanBotCancelSettings", "Cancel", 80, 22, function()
+        pendingScale        = NS.scale
+        pendingTransparency = NS.transparency
+        pendingAccentR      = NS.accentColor.r
+        pendingAccentG      = NS.accentColor.g
+        pendingAccentB      = NS.accentColor.b
+        pendingAccentA      = NS.accentColor.a
+        local savedMargins  = CleanBot_SavedVars and CleanBot_SavedVars.margins
+        for k, defaults in pairs(NS.MARGIN_DEFAULTS) do
+            local s = savedMargins and savedMargins[k]
+            if type(s) == "table" then
+                pendingMargins[k].top    = type(s.top)    == "number" and s.top    or defaults.top
+                pendingMargins[k].bottom = type(s.bottom) == "number" and s.bottom or defaults.bottom
+                pendingMargins[k].left   = type(s.left)   == "number" and s.left   or defaults.left
+                pendingMargins[k].right  = type(s.right)  == "number" and s.right  or defaults.right
+            else
+                pendingMargins[k].top    = defaults.top
+                pendingMargins[k].bottom = defaults.bottom
+                pendingMargins[k].left   = defaults.left
+                pendingMargins[k].right  = defaults.right
+            end
+        end
+        local savedPadding = CleanBot_SavedVars and CleanBot_SavedVars.padding
+        for k, defaults in pairs(NS.PADDING_DEFAULTS) do
+            local s = savedPadding and savedPadding[k]
+            if type(s) == "table" then
+                pendingPadding[k].top    = type(s.top)    == "number" and s.top    or defaults.top
+                pendingPadding[k].bottom = type(s.bottom) == "number" and s.bottom or defaults.bottom
+                pendingPadding[k].left   = type(s.left)   == "number" and s.left   or defaults.left
+                pendingPadding[k].right  = type(s.right)  == "number" and s.right  or defaults.right
+            else
+                pendingPadding[k].top    = defaults.top
+                pendingPadding[k].bottom = defaults.bottom
+                pendingPadding[k].left   = defaults.left
+                pendingPadding[k].right  = defaults.right
+            end
+        end
+        syncPendingToUI()
+    end)
+    NS.CB_AnchorWall(cancelBtn, panel, "BOTTOMRIGHT")
+
+    local applyBtn
+    applyBtn = NS.CB_CreateButton(panel, "CleanBotApplySettings", "Apply", 80, 22, function()
+        -- Set NS values + persist, then emit once (CB_EmitDisplaySettings) so the theme/layout
+        -- subscribers re-apply. No refresher is called directly here.
+        NS.scale       = pendingScale
+        NS.transparency = pendingTransparency
+        NS.accentColor.r = pendingAccentR
+        NS.accentColor.g = pendingAccentG
+        NS.accentColor.b = pendingAccentB
+        NS.accentColor.a = pendingAccentA
+        CleanBot_SavedVars.scale        = NS.scale
+        CleanBot_SavedVars.transparency = NS.transparency
+        CleanBot_SavedVars.accentColor  = { r = pendingAccentR, g = pendingAccentG, b = pendingAccentB, a = pendingAccentA }
+
+        -- Margins
+        if type(CleanBot_SavedVars.margins) ~= "table" then CleanBot_SavedVars.margins = {} end
+        for k, v in pairs(pendingMargins) do
+            NS.MARGIN[k].top    = v.top
+            NS.MARGIN[k].bottom = v.bottom
+            NS.MARGIN[k].left   = v.left
+            NS.MARGIN[k].right  = v.right
+            CleanBot_SavedVars.margins[k] = { top = v.top, bottom = v.bottom, left = v.left, right = v.right }
+        end
+
+        -- Padding
+        if type(CleanBot_SavedVars.padding) ~= "table" then CleanBot_SavedVars.padding = {} end
+        for k, v in pairs(pendingPadding) do
+            NS.PADDING[k].top    = v.top
+            NS.PADDING[k].bottom = v.bottom
+            NS.PADDING[k].left   = v.left
+            NS.PADDING[k].right  = v.right
+            CleanBot_SavedVars.padding[k] = { top = v.top, bottom = v.bottom, left = v.left, right = v.right }
+        end
+
+        if sampleLayoutFrame and sampleLayoutFrame:IsShown() then
+            buildSampleContent(sampleLayoutFrame._panel)
+        end
+        -- One emit applies scale/transparency/accent live via their subscribers, and (with the
+        -- layout flag) re-flows the UI for margin/padding changes via the Layout subscriber.
+        NS.CB_EmitDisplaySettings(true)
+        applyBtn:Disable()
+        NS.CB_Print("Settings applied.")
+    end)
+    applyBtn:SetPoint("RIGHT", cancelBtn, "LEFT",
+        -((applyBtn.marginRight or 0) + (cancelBtn.marginLeft or 0)), 0)
+    applyBtn:Disable()
+
+    local BTN_ROW_H = (panel.paddingBottom or 0) + NS.MARGIN.button.bottom + defaultsBtn:GetHeight() + NS.MARGIN.button.top + (panel.paddingBottom or 0)
+
+    -- ── Sub-tab bar ────────────────────────────────────────────
+    local subTabBar = CreateFrame("Frame", "CleanBotSettingsSubTabBar", panel)
+    subTabBar:SetPoint("TOPLEFT",  panel, "TOPLEFT",  0, 0)
+    subTabBar:SetPoint("TOPRIGHT", panel, "TOPRIGHT", 0, 0)
+    subTabBar:SetHeight(SUB_TAB_H)
+
+    -- ── Content panels ─────────────────────────────────────────
+    local themePanel = NS.CB_CreatePanel(panel, "CleanBotThemePanel", 3, "panel")
+    themePanel:SetPoint("TOPLEFT",     panel, "TOPLEFT",     0, -SUB_TAB_H)
+    themePanel:SetPoint("BOTTOMRIGHT", panel, "BOTTOMRIGHT", 0,  BTN_ROW_H)
+
+    local layoutPanel = NS.CB_CreatePanel(panel, "CleanBotLayoutPanel", 3, "panel")
+    layoutPanel:SetPoint("TOPLEFT",     panel, "TOPLEFT",     0, -SUB_TAB_H)
+    layoutPanel:SetPoint("BOTTOMRIGHT", panel, "BOTTOMRIGHT", 0,  BTN_ROW_H)
+    layoutPanel:Hide()
+
+    local otherPanel = NS.CB_CreatePanel(panel, "CleanBotOtherPanel", 3, "panel")
+    otherPanel:SetPoint("TOPLEFT",     panel, "TOPLEFT",     0, -SUB_TAB_H)
+    otherPanel:SetPoint("BOTTOMRIGHT", panel, "BOTTOMRIGHT", 0,  BTN_ROW_H)
+    otherPanel:Hide()
+
+    local debugPanel = NS.CB_CreatePanel(panel, "CleanBotDebugPanel", 3, "panel")
+    debugPanel:SetPoint("TOPLEFT",     panel, "TOPLEFT",     0, -SUB_TAB_H)
+    debugPanel:SetPoint("BOTTOMRIGHT", panel, "BOTTOMRIGHT", 0,  BTN_ROW_H)
+    debugPanel:Hide()
+
+    -- ── Sub-tab switching ──────────────────────────────────────
+    local subTabs      = {}
+    local activeSubTab = 0
+
+    local function selectSubTab(index)
+        if activeSubTab == index then return end
+        activeSubTab = index
+        for i, tab in ipairs(subTabs) do
+            tab:SetActive(i == index)
+        end
+        themePanel:Hide()
+        layoutPanel:Hide()
+        otherPanel:Hide()
+        debugPanel:Hide()
+        if index == 1 then
+            themePanel:Show()
+        elseif index == 2 then
+            layoutPanel:Show()
+        elseif index == 3 then
+            otherPanel:Show()
+        else
+            debugPanel:Show()
+        end
+    end
+
+    local themeTab = NS.CB_CreateTab(subTabBar, "CleanBotSettingsThemeTab", "Theme",
+        function() selectSubTab(1) end)
+    themeTab:SetWidth(NS.TAB_WIDTH)
+    NS.CB_Anchor(themeTab, function()
+        themeTab:ClearAllPoints()
+        themeTab:SetPoint("LEFT", subTabBar, "LEFT", (panel.paddingLeft or 0) + (themeTab.marginLeft or 0), 0)
+    end)
+    subTabs[1] = themeTab
+
+    local layoutTab = NS.CB_CreateTab(subTabBar, "CleanBotSettingsLayoutTab", "Layout",
+        function() selectSubTab(2) end)
+    layoutTab:SetWidth(NS.TAB_WIDTH)
+    NS.CB_AnchorAhead(layoutTab, themeTab)
+    subTabs[2] = layoutTab
+
+    local otherTab = NS.CB_CreateTab(subTabBar, "CleanBotSettingsOtherTab", "Other",
+        function() selectSubTab(3) end)
+    otherTab:SetWidth(NS.TAB_WIDTH)
+    NS.CB_AnchorAhead(otherTab, layoutTab)
+    subTabs[3] = otherTab
+
+    -- Debug sub-tab: hidden unless enabled via /cbdebug enable (persisted).
+    -- Last in the anchor chain, so hiding it leaves no gap in the tab bar.
+    local debugTab = NS.CB_CreateTab(subTabBar, "CleanBotSettingsDebugTab", "Debug",
+        function() selectSubTab(4) end)
+    debugTab:SetWidth(NS.TAB_WIDTH)
+    NS.CB_AnchorAhead(debugTab, otherTab)
+    subTabs[4] = debugTab
+    if not NS.debugTabEnabled then debugTab:Hide() end
+
+    -- Called by NS.CB_SetDebugTabEnabled (Debug.lua) when /cbdebug enable/disable
+    -- runs. Hiding while the Debug sub-tab is active falls back to Theme.
+    ---@param on boolean  Whether the Debug sub-tab button should be visible.
+    NS.CB_SetDebugTabVisible = function(on)
+        if on then
+            debugTab:Show()
+        else
+            debugTab:Hide()
+            if activeSubTab == 4 then selectSubTab(1) end
+        end
+    end
+
+    -- ── Theme tab: ScrollFrame ─────────────────────────────────
+    local themeSF, themeChild = NS.CB_CreateScrollFrame(themePanel, "CleanBotThemeScroll")
+    themeChild:SetHeight(300)
+
+    -- ── Scale ──────────────────────────────────────────────────
+    local scaleSlider = NS.CB_CreateSlider(themeChild, "CleanBotScaleSlider", "Scale",
+        50, 150, pendingScale, "50%", "150%", function(v) pendingScale = v; if syncApplyBtn then syncApplyBtn() end end)
+    scaleSlider:SetWidth(SLIDER_W)
+    NS.CB_AnchorWall(scaleSlider, themeChild, "TOPLEFT")
+
+    -- ── Transparency ───────────────────────────────────────────
+    local transSlider = NS.CB_CreateSlider(themeChild, "CleanBotTransSlider", "Transparency",
+        0, 100, pendingTransparency, "0%", "100%", function(v) pendingTransparency = v; if syncApplyBtn then syncApplyBtn() end end)
+    transSlider:SetWidth(SLIDER_W)
+    NS.CB_AnchorBelow(transSlider, scaleSlider)
+
+    -- ── Accent Color ───────────────────────────────────────────
+    local colorSwatch = NS.CB_CreateColorSwatch(themeChild, "CleanBotAccentSwatch", "Accent Color",
+        NS.accentColor.r, NS.accentColor.g, NS.accentColor.b,
+        function(r, g, b, a)
+            pendingAccentR, pendingAccentG, pendingAccentB, pendingAccentA = r, g, b, a
+            if syncApplyBtn then syncApplyBtn() end
+        end,
+        true, NS.accentColor.a)
+    NS.CB_AnchorBelow(colorSwatch, transSlider)
+
+    -- ── Layout tab: ScrollFrame ────────────────────────────────
+    local layoutSF, layoutChild = NS.CB_CreateScrollFrame(layoutPanel, "CleanBotLayoutScroll")
+    layoutChild:SetHeight(1200)
+
+    -- ── Show Sample Layout ─────────────────────────────────────
+    local sampleBtn = NS.CB_CreateButton(layoutChild, "CleanBotShowSampleLayout",
+        "Show Sample Layout", 140, 22, showSampleLayout)
+    NS.CB_AnchorWall(sampleBtn, layoutChild, "TOPLEFT")
+
+    local COL_TYPE_W = 80
+    local COL_GAP    = 10
+
+    local MARGIN_TYPES = {
+        { key = "panel",    display = "Panel"    },
+        { key = "section",  display = "Section"  },
+        { key = "tab",      display = "Tab"      },
+        { key = "header",   display = "Header"   },
+        { key = "label",    display = "Label"    },
+        { key = "button",   display = "Button"   },
+        { key = "slider",   display = "Slider"   },
+        { key = "dropdown", display = "Dropdown" },
+        { key = "checkbox", display = "Checkbox" },
+        { key = "swatch",   display = "Swatch"   },
+        { key = "editBox",  display = "Edit Box" },
+    }
+
+    local PADDING_TYPES = {
+        { key = "frame",   display = "Frame"   },
+        { key = "panel",   display = "Panel"   },
+        { key = "section", display = "Section" },
+    }
+
+    local marginSliderRefs  = {}
+    local paddingSliderRefs = {}
+
+    -- Scroll child is a borderless void — full width, no content padding.
+    -- Subtract the panel padding on both sides (scroll frame inset) plus 20px scroll bar.
+    local SEP_W = NS.EXPANDED_WIDTH - (panel.paddingLeft or 0) - (panel.paddingRight or 0) - 20
+    -- Separators span the content width; recompute + re-apply on a live padding change.
+    local layoutSeps = {}
+    NS.CB_RegisterRelayout(function()
+        local w = NS.EXPANDED_WIDTH - (panel.paddingLeft or 0) - (panel.paddingRight or 0) - 20
+        for _, s in ipairs(layoutSeps) do s:SetWidth(w) end
+    end)
+
+    -- ── Padding ────────────────────────────────────────────────
+    local paddingHeader = NS.CB_CreateHeader(layoutChild, "Padding")
+    NS.CB_AnchorBelow(paddingHeader, sampleBtn)
+
+    local paddingSep = NS.CB_CreateSeparator(layoutChild)
+    NS.CB_AnchorBelow(paddingSep, paddingHeader)
+    paddingSep:SetWidth(SEP_W)
+    layoutSeps[#layoutSeps + 1] = paddingSep
+
+    -- Scroll child is a borderless void — content starts at its left edge (no padding offset).
+    local COL_BASE = layoutChild.paddingLeft or 0
+
+    local prevRow = paddingSep
+    for i, ptype in ipairs(PADDING_TYPES) do
+        local key = ptype.key
+
+        local rowA = CreateFrame("Frame", nil, layoutChild)
+        rowA:SetSize(1, 54)
+        rowA.marginTop    = NS.MARGIN.label.top
+        rowA.marginBottom = 0
+        NS.CB_AnchorBelow(rowA, prevRow)
+
+        local nameLabel = NS.CB_CreateLabel(layoutChild, ptype.display)
+        nameLabel:SetPoint("TOPLEFT", rowA, "TOPLEFT", COL_BASE, 0)
+        nameLabel:SetWidth(COL_TYPE_W)
+        nameLabel:SetJustifyH("LEFT")
+
+        local P_MIN, P_MAX = 0, 40
+        local topSlider = NS.CB_CreateSlider(layoutChild, "CleanBotPadding_" .. key .. "_Top",
+            "Top", P_MIN, P_MAX, NS.PADDING[key].top, tostring(P_MIN), tostring(P_MAX),
+            function(v) pendingPadding[key].top = v; if syncApplyBtn then syncApplyBtn() end end)
+        topSlider:SetWidth(SLIDER_W)
+        topSlider:SetPoint("TOPLEFT", rowA, "TOPLEFT", COL_BASE + COL_TYPE_W + COL_GAP, 0)
+
+        local botSlider = NS.CB_CreateSlider(layoutChild, "CleanBotPadding_" .. key .. "_Bot",
+            "Bot", P_MIN, P_MAX, NS.PADDING[key].bottom, tostring(P_MIN), tostring(P_MAX),
+            function(v) pendingPadding[key].bottom = v; if syncApplyBtn then syncApplyBtn() end end)
+        botSlider:SetWidth(SLIDER_W)
+        botSlider:SetPoint("TOPLEFT", rowA, "TOPLEFT", COL_BASE + COL_TYPE_W + COL_GAP + SLIDER_W + COL_GAP, 0)
+
+        local rowB = CreateFrame("Frame", nil, layoutChild)
+        rowB:SetSize(1, 54)
+        rowB.marginTop    = 0
+        rowB.marginBottom = NS.MARGIN.slider.bottom
+        NS.CB_AnchorBelow(rowB, rowA)
+
+        local leftSlider = NS.CB_CreateSlider(layoutChild, "CleanBotPadding_" .. key .. "_Left",
+            "Left", P_MIN, P_MAX, NS.PADDING[key].left, tostring(P_MIN), tostring(P_MAX),
+            function(v) pendingPadding[key].left = v; if syncApplyBtn then syncApplyBtn() end end)
+        leftSlider:SetWidth(SLIDER_W)
+        leftSlider:SetPoint("TOPLEFT", rowB, "TOPLEFT", COL_BASE + COL_TYPE_W + COL_GAP, 0)
+
+        local rightSlider = NS.CB_CreateSlider(layoutChild, "CleanBotPadding_" .. key .. "_Right",
+            "Right", P_MIN, P_MAX, NS.PADDING[key].right, tostring(P_MIN), tostring(P_MAX),
+            function(v) pendingPadding[key].right = v; if syncApplyBtn then syncApplyBtn() end end)
+        rightSlider:SetWidth(SLIDER_W)
+        rightSlider:SetPoint("TOPLEFT", rowB, "TOPLEFT", COL_BASE + COL_TYPE_W + COL_GAP + SLIDER_W + COL_GAP, 0)
+
+        paddingSliderRefs[key] = { top = topSlider, bot = botSlider, left = leftSlider, right = rightSlider }
+        prevRow = rowB
+        if i < #PADDING_TYPES then
+            local sep = NS.CB_CreateSeparator(layoutChild)
+            NS.CB_AnchorBelow(sep, rowB)
+            sep:SetWidth(SEP_W)
+            layoutSeps[#layoutSeps + 1] = sep
+            prevRow = sep
+        end
+    end
+
+    -- ── Margins ────────────────────────────────────────────────
+    local marginsHeader = NS.CB_CreateHeader(layoutChild, "Margins")
+    marginsHeader.marginTop = NS.MARGIN.header.top + 8
+    NS.CB_AnchorBelow(marginsHeader, prevRow)
+
+    local marginsSep = NS.CB_CreateSeparator(layoutChild)
+    NS.CB_AnchorBelow(marginsSep, marginsHeader)
+    marginsSep:SetWidth(SEP_W)
+    layoutSeps[#layoutSeps + 1] = marginsSep
+
+    prevRow = marginsSep
+    for i, mtype in ipairs(MARGIN_TYPES) do
+        local key = mtype.key
+
+        -- Top/Bot sub-row — carries the type name label on the left.
+        local rowA = CreateFrame("Frame", nil, layoutChild)
+        rowA:SetSize(1, 54)
+        rowA.marginTop    = NS.MARGIN.label.top
+        rowA.marginBottom = 0
+        NS.CB_AnchorBelow(rowA, prevRow)
+
+        local nameLabel = NS.CB_CreateLabel(layoutChild, mtype.display)
+        nameLabel:SetPoint("TOPLEFT", rowA, "TOPLEFT", COL_BASE, 0)
+        nameLabel:SetWidth(COL_TYPE_W)
+        nameLabel:SetJustifyH("LEFT")
+
+        local M_RANGE = 20
+        local topSlider = NS.CB_CreateSlider(layoutChild, "CleanBotMargin_" .. key .. "_Top",
+            "Top", -M_RANGE, M_RANGE, NS.MARGIN[key].top, "-" .. M_RANGE, tostring(M_RANGE),
+            function(v) pendingMargins[key].top = v; if syncApplyBtn then syncApplyBtn() end end)
+        topSlider:SetWidth(SLIDER_W)
+        topSlider:SetPoint("TOPLEFT", rowA, "TOPLEFT", COL_BASE + COL_TYPE_W + COL_GAP, 0)
+
+        local botSlider = NS.CB_CreateSlider(layoutChild, "CleanBotMargin_" .. key .. "_Bot",
+            "Bot", -M_RANGE, M_RANGE, NS.MARGIN[key].bottom, "-" .. M_RANGE, tostring(M_RANGE),
+            function(v) pendingMargins[key].bottom = v; if syncApplyBtn then syncApplyBtn() end end)
+        botSlider:SetWidth(SLIDER_W)
+        botSlider:SetPoint("TOPLEFT", rowA, "TOPLEFT", COL_BASE + COL_TYPE_W + COL_GAP + SLIDER_W + COL_GAP, 0)
+
+        -- Left/Right sub-row — flush below Top/Bot, no extra gap between them.
+        local rowB = CreateFrame("Frame", nil, layoutChild)
+        rowB:SetSize(1, 54)
+        rowB.marginTop    = 0
+        rowB.marginBottom = NS.MARGIN.slider.bottom
+        NS.CB_AnchorBelow(rowB, rowA)
+
+        local leftSlider = NS.CB_CreateSlider(layoutChild, "CleanBotMargin_" .. key .. "_Left",
+            "Left", -M_RANGE, M_RANGE, NS.MARGIN[key].left, "-" .. M_RANGE, tostring(M_RANGE),
+            function(v) pendingMargins[key].left = v; if syncApplyBtn then syncApplyBtn() end end)
+        leftSlider:SetWidth(SLIDER_W)
+        leftSlider:SetPoint("TOPLEFT", rowB, "TOPLEFT", COL_BASE + COL_TYPE_W + COL_GAP, 0)
+
+        local rightSlider = NS.CB_CreateSlider(layoutChild, "CleanBotMargin_" .. key .. "_Right",
+            "Right", -M_RANGE, M_RANGE, NS.MARGIN[key].right, "-" .. M_RANGE, tostring(M_RANGE),
+            function(v) pendingMargins[key].right = v; if syncApplyBtn then syncApplyBtn() end end)
+        rightSlider:SetWidth(SLIDER_W)
+        rightSlider:SetPoint("TOPLEFT", rowB, "TOPLEFT", COL_BASE + COL_TYPE_W + COL_GAP + SLIDER_W + COL_GAP, 0)
+
+        marginSliderRefs[key] = { top = topSlider, bot = botSlider, left = leftSlider, right = rightSlider }
+        prevRow = rowB
+        if i < #MARGIN_TYPES then
+            local sep = NS.CB_CreateSeparator(layoutChild)
+            NS.CB_AnchorBelow(sep, rowB)
+            sep:SetWidth(SEP_W)
+            layoutSeps[#layoutSeps + 1] = sep
+            prevRow = sep
+        end
+    end
+
+    -- ── Other tab: ScrollFrame (content scrolls, like Theme/Layout) ──
+    local otherSF, otherChild = NS.CB_CreateScrollFrame(otherPanel, "CleanBotOtherScroll")
+    otherChild:SetHeight(1)   -- placeholder; sized to fit the content below (see updateOtherHeight)
+
+    -- ── Other tab: Bot Emotes ──────────────────────────────────
+    local botEmotesHeader = NS.CB_CreateHeader(otherChild, "Behavior")
+    NS.CB_AnchorWall(botEmotesHeader, otherChild, "TOPLEFT")
+
+    local EMOTE_TOOLTIP = "When enabled, switching to a bot's tab in the Individual panel sends an \"emote wave\" command, making them wave at you."
+    local botEmotesCB = NS.CB_CreateLabeledCheckBox(otherChild, "CleanBotBotEmotesCB", "Enable Bot Emotes", EMOTE_TOOLTIP)
+    botEmotesCB:SetChecked(NS.botEmotes)
+    NS.CB_AnchorBelow(botEmotesCB, botEmotesHeader)
+
+    botEmotesCB:SetScript("OnClick", function(self)
+        local checked = self:GetChecked() and true or false
+        self:SetChecked(checked)
+        NS.botEmotes = checked
+        CleanBot_SavedVars.botEmotes = checked
+    end)
+
+    -- ── Auto-Enable Self as Bot ────────────────────────────────
+    -- Preference only: when on, the addon runs `.playerbot bot self` once on a fresh
+    -- login so the player spawns managed. It does NOT toggle self-bot in the current
+    -- session (the command is a server toggle and the character spawns off, so re-sending
+    -- mid-session / on reload would flip it the wrong way). Live state is tracked from the
+    -- server's "Enable/Disable player botAI" messages instead. Not ElvUI-gated.
+    local SELF_BOT_TOOLTIP = "When enabled, CleanBot registers your own character as a bot (via .playerbot bot self) automatically each time you log in."
+    local selfBotCB = NS.CB_CreateLabeledCheckBox(otherChild, "CleanBotSelfBotCB", "Auto-Enable Self as Bot", SELF_BOT_TOOLTIP)
+    selfBotCB:SetChecked(NS.manageSelf == true)
+    NS.CB_AnchorBelow(selfBotCB, botEmotesCB)
+    -- Exposed so the first-time popup can tick the box when it enables the preference.
+    NS.CB_RefreshSelfBotCheckbox = function() selfBotCB:SetChecked(NS.manageSelf == true) end
+
+    -- Tracks the last Behavior checkbox so the next one anchors below it regardless of
+    -- whether the ElvUI-gated Item Glow box exists. Reassigned as more boxes are added.
+    local lastBehaviorCB = selfBotCB
+
+    selfBotCB:SetScript("OnClick", function(self)
+        local checked = self:GetChecked() and true or false
+        self:SetChecked(checked)
+        NS.manageSelf = checked
+        CleanBot_SavedVars.manageSelf = checked
+        -- Convenience: enabling the preference while not currently a self-bot turns it on
+        -- right now too (instead of waiting for next login). Guarded on the live state so
+        -- the pure-toggle command never flips an already-active self-bot off.
+        if checked and not NS.selfBotActive then
+            SendChatMessage(".playerbot bot self", "SAY")
+        end
+    end)
+
+    -- First-time popup (offered when the server first reports "Enable player botAI"):
+    -- a convenience to switch the auto-enable preference on.
+    NS.CB_RegisterConfirmPopup("CLEANBOT_SELFBOT_AUTO",
+        "You enabled self-bot management. Automatically enable it each time you log in?",
+        function()
+            NS.manageSelf = true
+            if CleanBot_SavedVars then CleanBot_SavedVars.manageSelf = true end
+            if NS.CB_RefreshSelfBotCheckbox then NS.CB_RefreshSelfBotCheckbox() end
+        end)
+
+    -- ── Enable Item Glow (Blizz UI path only) ──────────────────
+    -- The rarity overlay only exists on the Blizz path, so the toggle is created only
+    -- there; ElvUI shows item quality through its own button border.
+    if not NS.ElvUI_S then
+        local ITEM_GLOW_TOOLTIP = "When enabled, items and equipment of uncommon quality or higher show a rarity-colored glow."
+        local itemGlowCB = NS.CB_CreateLabeledCheckBox(otherChild, "CleanBotItemGlowCB", "Enable Item Glow", ITEM_GLOW_TOOLTIP)
+        itemGlowCB:SetChecked(NS.itemGlow ~= false)
+        NS.CB_AnchorBelow(itemGlowCB, selfBotCB)
+        lastBehaviorCB = itemGlowCB
+
+        itemGlowCB:SetScript("OnClick", function(self)
+            local checked = self:GetChecked() and true or false
+            self:SetChecked(checked)
+            NS.itemGlow = checked
+            CleanBot_SavedVars.itemGlow = checked
+            if NS.CB_RefreshRarityOverlays then NS.CB_RefreshRarityOverlays() end
+        end)
+    end
+
+    -- ── Hide Bot Chatter (not ElvUI-gated) ─────────────────────
+    -- Filters CleanBot's own whisper commands, the expected bot replies, and the
+    -- server command output it triggers out of the chat window (see ChatFilter.lua).
+    -- The filters read NS.hideBotChatter live, so toggling here applies immediately.
+    local HIDE_CHATTER_TOOLTIP = "When enabled, CleanBot hides its own whispered commands, the bot replies it requests (stats, strategies, inventory, quests), and the server output it triggers from your chat window. Turn off to see the raw traffic for testing."
+    local hideChatterCB = NS.CB_CreateLabeledCheckBox(otherChild, "CleanBotHideChatterCB", "Hide Bot Chatter", HIDE_CHATTER_TOOLTIP)
+    hideChatterCB:SetChecked(NS.hideBotChatter ~= false)
+    NS.CB_AnchorBelow(hideChatterCB, lastBehaviorCB)
+
+    hideChatterCB:SetScript("OnClick", function(self)
+        local checked = self:GetChecked() and true or false
+        self:SetChecked(checked)
+        NS.hideBotChatter = checked
+        CleanBot_SavedVars.hideBotChatter = checked
+    end)
+
+    -- ── Dungeon Finder Recruiter (Recruiter.lua) ───────────────
+    local recruiterHeader = NS.CB_CreateHeader(otherChild, "Dungeon Finder")
+    NS.CB_AnchorBelow(recruiterHeader, hideChatterCB)
+
+    local recruiterCB = NS.CB_CreateLabeledCheckBox(otherChild, "CleanBotRecruiterCB", "Show Recruiter Tab",
+        "Attach a bot-recruiter tab to the Dungeon Finder window: pick a role and class to summon a level-matched bot into your party.")
+    recruiterCB:SetChecked(NS.recruiterEnabled ~= false)
+    NS.CB_AnchorBelow(recruiterCB, recruiterHeader)
+    recruiterCB:SetScript("OnClick", function(self)
+        local checked = self:GetChecked() and true or false
+        self:SetChecked(checked)
+        NS.recruiterEnabled = checked
+        CleanBot_SavedVars.recruiterEnabled = checked
+        if NS.CB_RefreshRecruiter then NS.CB_RefreshRecruiter() end
+    end)
+
+    -- ── Action Bar section (mirrors the minimap right-click toggles) ────
+    local actionBarHeader = NS.CB_CreateHeader(otherChild, "Action Bar")
+    NS.CB_AnchorBelow(actionBarHeader, recruiterCB)
+
+    local actionBarCB = NS.CB_CreateLabeledCheckBox(otherChild, "CleanBotActionBarCB", "Show Action Bar",
+        "Show a small standalone bar of bot-command buttons (Summon, Passive). Also toggled by right-clicking the minimap icon.")
+    actionBarCB:SetChecked(NS.actionBarShown == true)
+    NS.CB_AnchorBelow(actionBarCB, actionBarHeader)
+    actionBarCB:SetScript("OnClick", function(self)
+        if NS.CB_SetActionBarShown then NS.CB_SetActionBarShown(self:GetChecked() and true or false) end
+    end)
+
+    local actionBarEditCB = NS.CB_CreateLabeledCheckBox(otherChild, "CleanBotActionBarEditCB", "Action Bar Edit Mode",
+        "Disable the action bar's buttons and let it be dragged to reposition (it snaps to nearby frames). Resets off each session. Also: Shift+Right-click the minimap icon.")
+    actionBarEditCB:SetChecked(NS.actionBarEditMode == true)
+    NS.CB_AnchorBelow(actionBarEditCB, actionBarCB)
+    actionBarEditCB:SetScript("OnClick", function(self)
+        if NS.CB_SetActionBarEditMode then NS.CB_SetActionBarEditMode(self:GetChecked() and true or false) end
+    end)
+
+    -- Lets the minimap toggles keep these boxes in sync (mirrors CB_RefreshSelfBotCheckbox).
+    NS.CB_RefreshActionBarChecks = function()
+        actionBarCB:SetChecked(NS.actionBarShown == true)
+        actionBarEditCB:SetChecked(NS.actionBarEditMode == true)
+    end
+
+    -- "Customize" collapsible section: per-button enable/disable, laid out in LIVE BAR ORDER. Each slot
+    -- has a master checkbox (show/hide the whole button); multi-action slots also list a checkbox per
+    -- action (the bar button is the first enabled action; the rest are its flyout) indented beneath.
+    -- Toggling applies live + persisted; reordering is by shift-dragging the buttons on the bar — which
+    -- calls CB_RefreshActionBarButtonList to re-flow this list into the new order.
+    local customSec = NS.CB_CreateSection(otherChild, "actionBarCustomize", "Customize", 4)
+    NS.CB_AnchorBelow(customSec.toggleBtn, actionBarEditCB)
+
+    -- Pre-create every checkbox once (positioned later by relayoutButtonRows). slotMasterCB[slotId];
+    -- actionCB[slotId][actionId] (multi-action slots only).
+    local slotMasterCB, actionCB = {}, {}
+    for _, s in ipairs(NS.CB_actionSlots or {}) do
+        local master = NS.CB_CreateLabeledCheckBox(customSec.bg, "CleanBotABSlotSet_" .. s.id, s.title,
+            "Show or hide the " .. s.title .. " button.")
+        master:SetScript("OnClick", function(self)
+            if NS.CB_SetSlotEnabled then NS.CB_SetSlotEnabled(s.id, self:GetChecked() and true or false) end
+        end)
+        slotMasterCB[s.id] = master
+        if #s.actions > 1 then
+            actionCB[s.id] = {}
+            for _, a in ipairs(s.actions) do
+                local acb = NS.CB_CreateLabeledCheckBox(customSec.bg, "CleanBotABActSet_" .. s.id .. "_" .. a.id, a.title, a.desc)
+                acb:SetScript("OnClick", function(self)
+                    if NS.CB_SetChildEnabled then NS.CB_SetChildEnabled(s.id, a.id, self:GetChecked() and true or false) end
+                end)
+                actionCB[s.id][a.id] = acb
+            end
+        end
+    end
+
+    -- Size the scroll child to fit the content (like the Manage tab) so the scrollbar range matches.
+    -- The bottommost visible widget is the Customize section's anchor; GetTop/GetBottom need a rendered
+    -- frame, so the update is deferred via a one-shot OnUpdate.
+    local function updateOtherHeight()
+        local top, last = otherChild:GetTop(), customSec:GetAnchor()
+        local bottom = last and last:GetBottom()
+        if not (top and bottom) then return end
+        local contentH = top - bottom + (last.marginBottom or 0) + (otherChild.paddingBottom or 0)
+        otherChild:SetHeight(math.max(contentH, otherSF:GetHeight() or 0))
+    end
+    local function scheduleOtherUpdate()
+        otherChild:SetScript("OnUpdate", function(self)
+            self:SetScript("OnUpdate", nil)
+            customSec:UpdateBackground()
+            updateOtherHeight()
+        end)
+    end
+
+    -- Lays out the checkboxes in live bar order: slot masters flush-left, their actions indented in
+    -- flyout order. Two-anchor (LEFT to bg for X, TOP to prev for Y) keeps masters flush regardless of
+    -- the indented action above. Sets the section's last widget so its bg + the scroll height track it.
+    local function relayoutButtonRows()
+        local lay  = NS.CB_actionBarLayout or {}
+        local padL = (customSec.bg.paddingLeft or 0)
+        local prev = nil
+        for _, sid in ipairs(lay.slotOrder or {}) do
+            local master = slotMasterCB[sid]
+            if master then
+                master:ClearAllPoints()
+                master:SetPoint("LEFT", customSec.bg, "LEFT", padL, 0)
+                if prev then master:SetPoint("TOP", prev, "BOTTOM", 0, -4)
+                else          master:SetPoint("TOP", customSec.bg, "TOP", 0, -(customSec.bg.paddingTop or 0)) end
+                prev = master
+                local order = lay.childOrder and lay.childOrder[sid]
+                if order and actionCB[sid] then
+                    for _, aid in ipairs(order) do
+                        local acb = actionCB[sid][aid]
+                        if acb then
+                            acb:ClearAllPoints()
+                            acb:SetPoint("LEFT", customSec.bg, "LEFT", padL + 18, 0)
+                            acb:SetPoint("TOP", prev, "BOTTOM", 0, -4)
+                            prev = acb
+                        end
+                    end
+                end
+            end
+        end
+        customSec.lastWidget, customSec.frame = prev, prev
+    end
+
+    -- Syncs checkbox states from the live layout AND re-flows the rows into the current bar order. Called
+    -- at build and by ActionBar after it loads SavedVars / after a shift-drag reorder.
+    NS.CB_RefreshActionBarButtonList = function()
+        for sid, master in pairs(slotMasterCB) do
+            master:SetChecked(not NS.CB_IsSlotEnabled or NS.CB_IsSlotEnabled(sid))
+        end
+        for sid, acts in pairs(actionCB) do
+            for aid, acb in pairs(acts) do
+                acb:SetChecked(not NS.CB_IsChildEnabled or NS.CB_IsChildEnabled(sid, aid))
+            end
+        end
+        relayoutButtonRows()
+        scheduleOtherUpdate()
+    end
+
+    relayoutButtonRows()
+    customSec:Apply()                            -- show/position the section bg
+    NS.CB_RefreshActionBarButtonList()
+    customSec.onToggle = scheduleOtherUpdate      -- recompute height after collapse/expand
+    NS.CB_RegisterRelayout(function() relayoutButtonRows(); scheduleOtherUpdate() end)
+
+    -- ── Debug tab ──────────────────────────────────────────────
+    -- Revealed by /cbdebug enable (persisted). Immediate-on-change — no Apply:
+    -- every control routes through the shared setters in Debug.lua, which
+    -- persist + re-sync and call NS.CB_RefreshDebugTab, so the slash commands
+    -- and this UI always agree. Setter references are late-bound closures
+    -- because Debug.lua loads after this file.
+
+    -- Debug-panel checkbox: label + hover/click tooltip via the shared labeled-checkbox helper.
+    local function CB_MakeDebugCheck(name, labelText, tooltip, anchor, onClick)
+        local cb = NS.CB_CreateLabeledCheckBox(debugPanel, name, labelText, tooltip)
+        NS.CB_AnchorBelow(cb, anchor)
+        cb:SetScript("OnClick", function(self) onClick(self:GetChecked() and true or false) end)
+        return cb
+    end
+
+    local bridgeHeader = NS.CB_CreateHeader(debugPanel, "Bridge Override")
+    NS.CB_AnchorWall(bridgeHeader, debugPanel, "TOPLEFT")
+
+    -- Wide enough for the longest collapsed label, "Auto (unknown)".
+    local bridgeDD = NS.CB_CreateDropdown(debugPanel, "CleanBotDebugBridgeDD", 170)
+    NS.CB_AnchorBelow(bridgeDD, bridgeHeader)
+    UIDropDownMenu_Initialize(bridgeDD, function()
+        local opts = {
+            { text = "On (force present)", value = "present" },
+            { text = "Off (force absent)", value = "absent"  },
+        }
+        for _, o in ipairs(opts) do
+            local info = UIDropDownMenu_CreateInfo()
+            info.text    = o.text
+            info.value   = o.value
+            info.checked = (NS.debugBridgeOverride == o.value)
+            info.func    = function() NS.CB_SetBridgeOverride(o.value) end
+            UIDropDownMenu_AddButton(info)
+        end
+    end)
+
+    local bridgeResetBtn = NS.CB_CreateButton(debugPanel, "CleanBotDebugBridgeReset", "Reset", 70, 22,
+        function() NS.CB_SetBridgeOverride(nil) end)
+    NS.CB_AnchorAhead(bridgeResetBtn, bridgeDD)
+
+    local simulateCB = CB_MakeDebugCheck("CleanBotDebugSimulateCB", "Simulate Commands",
+        "Print bot commands to chat instead of sending them.",
+        bridgeDD, function(v) NS.CB_SetDebugSimulate(v) end)
+
+    local verifyCB = CB_MakeDebugCheck("CleanBotDebugVerifyCB", "Verify Strategy Toggles",
+        "After each strategy toggle, log any mismatch between the optimistic UI state and the bot's actual state.",
+        simulateCB, function(v) NS.CB_SetDebugVerify(v) end)
+
+    local diagHeader = NS.CB_CreateHeader(debugPanel, "Diagnostics")
+    NS.CB_AnchorBelow(diagHeader, verifyCB)
+
+    local traceCB = CB_MakeDebugCheck("CleanBotDebugTraceCB", "Trace NotifyInspect",
+        "Print every NotifyInspect call from any addon, tagged CleanBot or EXTERNAL (session only; not saved).",
+        diagHeader, function(v) NS.CB_SetInspectTrace(v) end)
+
+    local knownBotsBtn = NS.CB_CreateButton(debugPanel, "CleanBotDebugKnownBotsBtn", "Known Bots", 110, 22,
+        function() NS.CB_ShowDebugKnownBots() end)
+    NS.CB_AnchorBelow(knownBotsBtn, traceCB)
+
+    local timingBtn = NS.CB_CreateButton(debugPanel, "CleanBotDebugTimingBtn", "Measure Reply Timing", 150, 22,
+        function() NS.CB_RunTimingMeasure(3) end)
+    NS.CB_AnchorAhead(timingBtn, knownBotsBtn)
+
+    local iconBrowserBtn = NS.CB_CreateButton(debugPanel, "CleanBotDebugIconBrowserBtn", "Icon Browser", 110, 22,
+        function() if NS.CB_ToggleIconBrowser then NS.CB_ToggleIconBrowser() end end)
+    NS.CB_AnchorBelow(iconBrowserBtn, knownBotsBtn)
+
+    local layoutTestCB = CB_MakeDebugCheck("CleanBotDebugLayoutTestCB", "Layout Test Buttons",
+        "Show the centered Randomize/Reset Layout buttons for spam-testing live margin/padding re-flow.",
+        iconBrowserBtn, function(v) if NS.CB_SetLayoutTestButtons then NS.CB_SetLayoutTestButtons(v) end end)
+
+    -- Syncs all Debug-tab controls from NS state. Called at build and by every
+    -- setter in Debug.lua (so slash-command changes update an open panel).
+    NS.CB_RefreshDebugTab = function()
+        if NS.debugBridgeOverride == "present" then
+            UIDropDownMenu_SetText(bridgeDD, "On (forced)")
+        elseif NS.debugBridgeOverride == "absent" then
+            UIDropDownMenu_SetText(bridgeDD, "Off (forced)")
+        else
+            UIDropDownMenu_SetText(bridgeDD, "Auto (" .. tostring(NS.bridgeState) .. ")")
+        end
+        simulateCB:SetChecked(NS.debugSimulate and true or false)
+        verifyCB:SetChecked(NS.debugVerify and true or false)
+        traceCB:SetChecked(NS.debugInspectTrace and true or false)
+        layoutTestCB:SetChecked(NS.layoutTestButtons and true or false)
+    end
+    NS.CB_RefreshDebugTab()
+
+    -- ── Sync helper ────────────────────────────────────────────
+    syncPendingToUI = function()
+        scaleSlider:SetValue(pendingScale)
+        transSlider:SetValue(pendingTransparency)
+        colorSwatch:setColor(pendingAccentR, pendingAccentG, pendingAccentB, pendingAccentA)
+        for key, refs in pairs(marginSliderRefs) do
+            refs.top:SetValue(pendingMargins[key].top)
+            refs.bot:SetValue(pendingMargins[key].bottom)
+            refs.left:SetValue(pendingMargins[key].left)
+            refs.right:SetValue(pendingMargins[key].right)
+        end
+        for key, refs in pairs(paddingSliderRefs) do
+            refs.top:SetValue(pendingPadding[key].top)
+            refs.bot:SetValue(pendingPadding[key].bottom)
+            refs.left:SetValue(pendingPadding[key].left)
+            refs.right:SetValue(pendingPadding[key].right)
+        end
+        syncApplyBtn()
+    end
+
+    syncApplyBtn = function()
+        local dirty = pendingScale ~= NS.scale
+            or pendingTransparency ~= NS.transparency
+            or pendingAccentR ~= NS.accentColor.r
+            or pendingAccentG ~= NS.accentColor.g
+            or pendingAccentB ~= NS.accentColor.b
+            or pendingAccentA ~= NS.accentColor.a
+        if not dirty then
+            for k, v in pairs(pendingMargins) do
+                local m = NS.MARGIN[k]
+                if m and (v.top ~= m.top or v.bottom ~= m.bottom or v.left ~= m.left or v.right ~= m.right) then
+                    dirty = true
+                    break
+                end
+            end
+        end
+        if not dirty then
+            for k, v in pairs(pendingPadding) do
+                local p = NS.PADDING[k]
+                if p and (v.top ~= p.top or v.bottom ~= p.bottom or v.left ~= p.left or v.right ~= p.right) then
+                    dirty = true
+                    break
+                end
+            end
+        end
+        if dirty then applyBtn:Enable() else applyBtn:Disable() end
+    end
+
+    selectSubTab(1)
+end
