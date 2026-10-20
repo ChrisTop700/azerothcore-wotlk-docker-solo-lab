@@ -1,64 +1,85 @@
 # Bot Companion Management & In-Game Cheatsheet
 
-This reference details how to hire, control, and equip **NPCBots**, as well as how **AutoBalance** interacts with your party.
+This reference details how to summon, control, and equip **Playerbots**, as well as how **AutoBalance** interacts with your party.
 
 ---
 
-## 1. NPCBots In-Game Commands
+## 1. Playerbots In-Game Commands
 
-All commands require GM permissions (level 2 or 3) unless enabled for regular players in `worldserver.conf`.
+Playerbots are real player characters stored in the `characters` database. You can manage them through chat commands, whispers, or visually using the [CleanBot](https://github.com/bennybroseph/CleanBot) addon.
 
-### Spawning & Finding Bots
-* `.npcbot lookup <class>` — Search for available NPC bot entries by class (e.g., `warrior`, `paladin`, `hunter`, `rogue`, `priest`, `deathknight`, `shaman`, `mage`, `warlock`, `druid`).
-* `.npcbot spawn <entry_id>` — Permanently spawn a specific bot NPC at your player coordinates.
+### Summoning & Grouping
+* `.playerbots bot add <CharacterName>` — Log in an alt character or world bot and add them to your party.
+  *(Example: `.playerbots bot add Pier`)*
+* `.playerbots bot remove <CharacterName>` — Dismiss the bot from your party and save character progress to the database.
+* `.playerbots bot addclass <class> [male|female]` — Summon a level-matched bot of a specific class.
+  *(Example: `.playerbots bot addclass warrior male`)*
+* `.playerbots bot list` — View all active bots under your command.
 
-### Recruiting & Dismissing
-* Target an NPC bot in the world and type:
-  ```text
-  .npcbot add
-  ```
-  *(The bot joins your party as a companion).*
-* To dismiss a bot from your party:
-  ```text
-  .npcbot remove
-  ```
-* To view current bot stats and role:
-  ```text
-  .npcbot info
-  ```
+### Account Linking (For Alt Accounts)
+To summon characters created on separate accounts:
+1. Log into your alt account and set a security key:
+   ```text
+   .playerbots account setKey <mySecretKey>
+   ```
+2. Log into your main character and link the account:
+   ```text
+   .playerbots account link <altAccountName> <mySecretKey>
+   ```
+3. Once linked, you can summon any character on that account with `.playerbots bot add <name>` or via the CleanBot Manage tab.
 
-### Tactical Combat Directives
-* `.npcbot command attack` — Orders party bots to engage your current target.
-* `.npcbot command follow` — Forces bots to cease combat and immediately return to your side.
-* `.npcbot command hold` — Orders bots to hold their current position.
-* `.npcbot distance <value>` — Sets the follow distance behind your character (default: `30`).
+### Tactical Combat & Movement Directives
+You can command bots via `/party` or by whispering individual bots:
+* **Attack / Pull**:
+  * Whisper `attack` or type `/party do attack my target` — Orders bots to engage your target.
+  * Whisper `pull` or type `/party pull my target` — Orders tank bots to pull your target.
+* **Movement & Stance**:
+  * Whisper `follow` — Bots follow closely behind you.
+  * Whisper `stay` or `hold` — Bots hold their current position.
+  * Whisper `flee` or `runaway` — Bots disengage and retreat toward you.
+  * Whisper `passive` — Bots cease attacking and stand down.
+* **Prep & Recovery**:
+  * Whisper `rebuff` — Bots refresh missing class buffs and auras.
+  * Whisper `food` / `drink` — Bots sit and recover health/mana.
+  * Whisper `release` — Dead bots release spirit.
+  * Whisper `revive` — Living bots resurrect fallen party members.
 
-### Roles, Specs, & Equipment
-* Right-click or interact with recruited bots to:
-  * Select their talent tree / specialization (e.g., Holy vs. Protection Paladin).
-  * Enable/disable specific spells and buffs.
-  * Trade equipment directly to them (bots equip weapons, armor, rings, and trinkets matching their class).
+### Equipment & Roles
+* **Role Selection**:
+  * Whisper `tank` — Configures bot for tanking stance, threat generation, and defensive cooldowns.
+  * Whisper `heal` — Prioritizes healing and dispelling party members.
+  * Whisper `dps` — Focuses on damage rotations and crowd control.
+* **Gearing**:
+  * Whisper `equip` or `autogear` — Bot equips the highest item level / best stats from their bags.
+  * Trade items directly to bots via the trade window; they accept suitable gear upgrades.
+  * Drag-and-drop gear into their paperdoll using the **CleanBot** Individual tab.
 
 ---
 
 ## 2. Essential In-Game Macros
 
-Create these macros in your WoW client for smooth party command:
+Create these macros in your WoW client for rapid command without typing:
 
-### Macro 1: "Bots Engage"
+### Macro 1: "Bots Attack My Target"
 ```text
-/npcbot command attack
+/party do attack my target
 ```
 
-### Macro 2: "Bots Fall Back"
+### Macro 2: "Bots Pull Target"
 ```text
-/npcbot command follow
-/npcbot command hold
+/party pull my target
 ```
 
-### Macro 3: "Recruit Target"
+### Macro 3: "Bots Fall Back"
 ```text
-/npcbot add
+/party follow
+/party stay
+```
+
+### Macro 4: "Rebuff & Prep"
+```text
+/party rebuff
+/party autogear
 ```
 
 ---
@@ -68,7 +89,7 @@ Create these macros in your WoW client for smooth party command:
 `mod-autobalance` dynamically scales creature and boss attributes in real-time based on group size:
 
 * **Party Size Calculation**: 
-  AutoBalance naturally detects NPCBots in your party. If you enter a 5-man dungeon with yourself and 2 bots, the instance will automatically scale health and damage to a **3-person difficulty**.
+  AutoBalance naturally detects Playerbots in your party. If you enter a 5-man dungeon with yourself and 2 bots, the instance dynamically scales enemy health and damage to a **3-person difficulty**.
 * **Solo Dungeon Crawling**:
   If you dismiss all bots and enter an instance solo, AutoBalance will scale creature health, melee damage, and spell damage down to single-player levels.
 * **Boss CC & Mechanics**:

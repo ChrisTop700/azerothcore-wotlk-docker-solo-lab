@@ -82,8 +82,9 @@ Install Docker Desktop and WSL 2 on the new machine.
 
 ### Step 2: Clone Core & Modules
 ```bash
-git clone --depth 1 -b npcbots_3.3.5 https://github.com/trickerer/AzerothCore-wotlk-with-NPCBots.git ~/azerothcore-wotlk
+git clone --depth 1 -b Playerbot https://github.com/mod-playerbots/azerothcore-wotlk.git ~/azerothcore-wotlk
 cd ~/azerothcore-wotlk/modules
+git clone --depth 1 https://github.com/mod-playerbots/mod-playerbots.git
 git clone --depth 1 https://github.com/azerothcore/mod-autobalance.git
 git clone --depth 1 https://github.com/azerothcore/mod-ah-bot.git
 ```

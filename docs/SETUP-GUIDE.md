@@ -37,24 +37,27 @@ Open PowerShell or Windows Terminal and start Ubuntu:
 wsl -d Ubuntu
 ```
 
-### Step 2: Clone Core with NPCBots
-We use the actively maintained `trickerer/AzerothCore-wotlk-with-NPCBots` core repository (branch `npcbots_3.3.5`) because NPCBots requires deeper C++ engine hooks than standalone scripting modules provide:
+### Step 2: Clone Core with Playerbots
+We use the actively maintained `mod-playerbots/azerothcore-wotlk` core repository (branch `Playerbot`) because Playerbots requires core C++ engine hooks for bot sessions:
 
 ```bash
 cd ~
-git clone --depth 1 -b npcbots_3.3.5 https://github.com/trickerer/AzerothCore-wotlk-with-NPCBots.git azerothcore-wotlk
+git clone --depth 1 -b Playerbot https://github.com/mod-playerbots/azerothcore-wotlk.git azerothcore-wotlk
 ```
 
 ### Step 3: Clone Companion Modules
-Clone `mod-autobalance` and `mod-ah-bot` directly into the `modules/` folder:
+Clone `mod-playerbots`, `mod-autobalance`, and `mod-ah-bot` directly into the `modules/` folder:
 
 ```bash
 cd ~/azerothcore-wotlk/modules
 
-# 1. Dynamic creature/boss stat scaling for small parties
+# 1. Playerbot AI companion and world simulation engine
+git clone --depth 1 https://github.com/mod-playerbots/mod-playerbots.git
+
+# 2. Dynamic creature/boss stat scaling for small parties
 git clone --depth 1 https://github.com/azerothcore/mod-autobalance.git
 
-# 2. Automated Auction House buyer/seller bot
+# 3. Automated Auction House buyer/seller bot
 git clone --depth 1 https://github.com/azerothcore/mod-ah-bot.git
 ```
 
@@ -71,21 +74,23 @@ cd ~/azerothcore-wotlk
 mkdir -p env/dist/etc/modules
 
 # Copy default configurations
+cp modules/mod-playerbots/conf/playerbots.conf.dist env/dist/etc/modules/playerbots.conf
 cp modules/mod-autobalance/conf/AutoBalance.conf.dist env/dist/etc/modules/AutoBalance.conf
 cp modules/mod-ah-bot/conf/mod_ahbot.conf.dist env/dist/etc/modules/mod_ahbot.conf
 ```
 
 ### Recommended Configuration Adjustments
 
+* **Playerbots (`env/dist/etc/modules/playerbots.conf`)**:
+  - `Playerbots.RandomBotAutoJoinBG = 1` (Enables bots participating in Battlegrounds).
+  - `Playerbots.AutoGearCommand = 1` and `Playerbots.AutoGearCommandAltBots = 1` (Allows bots to automatically equip gear upgrades).
+  - Configures random bot population limits, altbot linking, and RDF dungeon finder bot queues.
+
 * **AutoBalance (`env/dist/etc/modules/AutoBalance.conf`)**:
   - `AutoBalance.Enable = 1`
   - `AutoBalance.DungeonMinScaling = 1` (Allows 5-man dungeons to scale down to 1 player).
   - `AutoBalance.RaidMinScaling = 1` (Allows raids to scale down to small groups).
-  - *Note:* AutoBalance automatically factors active NPCBots into party size calculations.
-
-* **NPCBots (`src/server/apps/worldserver/worldserver.conf.dist` or environment overrides)**:
-  - NPCBots are enabled by default (`NpcBot.Enable = 1`).
-  - Max bots allowed per group defaults to 39, enabling full 5-man, 10-man, or 25-man formations.
+  - *Note:* AutoBalance automatically factors active Playerbots into party size calculations.
 
 * **Auction House Bot (`env/dist/etc/modules/mod_ahbot.conf`)**:
   - `AuctionHouseBot.EnableSeller = 1` (Generates random trade goods, consumables, and gear across all quality tiers).
@@ -107,7 +112,7 @@ docker compose up -d --build
 2. **`ac-client-data-init`**: Downloads/extracts pre-built client data (DBC, maps, vmaps, mmaps) directly into a named Docker volume (`ac-client-data`), eliminating hours of manual client file extraction.
 3. **`ac-db-import`**: Automatically discovers and imports SQL tables and updates for the core and all modules.
 4. **`ac-authserver`**: Compiles and launches the logon authentication service.
-5. **`ac-worldserver`**: Compiles the core engine with NPCBots and modules, then launches the world service.
+5. **`ac-worldserver`**: Compiles the core engine with Playerbots and modules, then launches the world service.
 
 Verify that all containers are healthy:
 ```bash
@@ -135,12 +140,12 @@ To interact with the running worldserver console:
 
 ---
 
-## 6. Client Connection
+## 6. Client Connection & Addons
 
 1. Open your **World of Warcraft: Wrath of the Lich King (3.3.5a, Build 12340)** client directory.
-2. Navigate to `Data/enUS/realmlist.wtf` (or your localized directory such as `Data/enGB/realmlist.wtf`).
-3. Open `realmlist.wtf` in a text editor and set:
+2. Set realmlist in `Data/enUS/realmlist.wtf` (or `Data/enGB/realmlist.wtf`):
    ```text
    set realmlist 127.0.0.1
    ```
+3. Install **CleanBot** in `Interface/AddOns/CleanBot` for in-game bot management (`/bot` or `/cb`).
 4. Launch `WoW.exe` and log in using your newly created account credentials.
