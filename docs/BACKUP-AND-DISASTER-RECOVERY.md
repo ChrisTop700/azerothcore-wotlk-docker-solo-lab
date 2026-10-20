@@ -95,10 +95,11 @@ docker compose up -d --build
 ### Step 4: Restore Backup Snapshot
 Use [`scripts/restore.sh`](../scripts/restore.sh) or restore manually:
 ```bash
-# Extract configs
+# Extract configs (modules, portal overrides)
+tar -xzf /mnt/nas_backup/<TIMESTAMP>/configs_*.tar.gz -C ~/azerothcore-wotlk/ 2>/dev/null || \
 tar -xzf /mnt/nas_backup/<TIMESTAMP>/modules_config_*.tar.gz -C ~/azerothcore-wotlk/
 
-# Stream databases directly into MySQL container
+# Stream databases directly into MySQL container (auth, characters, blizzcms)
 gunzip -c /mnt/nas_backup/<TIMESTAMP>/acore_live_data_*.sql.gz | docker exec -i ac-database mysql -u root -p<DB_PASSWORD>
 gunzip -c /mnt/nas_backup/<TIMESTAMP>/acore_world_*.sql.gz | docker exec -i ac-database mysql -u root -p<DB_PASSWORD> acore_world
 

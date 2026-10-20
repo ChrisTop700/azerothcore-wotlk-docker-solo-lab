@@ -49,10 +49,10 @@ else
     echo "Warning: No acore_world_*.sql.gz archive found in ${BACKUP_FOLDER}."
 fi
 
-# 4. Restore module configurations
-CONFIG_FILE=$(find "${BACKUP_FOLDER}" -name "modules_config_*.tar.gz" | head -n 1)
-if [ -f "${CONFIG_FILE}" ]; then
-    echo "Restoring module configurations from ${CONFIG_FILE}..."
+# 4. Restore configurations (modules, web portal, overrides)
+CONFIG_FILE=$(find "${BACKUP_FOLDER}" \( -name "configs_*.tar.gz" -o -name "modules_config_*.tar.gz" \) | head -n 1)
+if [ -n "${CONFIG_FILE}" ] && [ -f "${CONFIG_FILE}" ]; then
+    echo "Restoring configurations from ${CONFIG_FILE}..."
     tar -xzf "${CONFIG_FILE}" -C "${REPO_DIR}"
 fi
 

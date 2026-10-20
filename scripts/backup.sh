@@ -36,12 +36,12 @@ if ! docker ps --format '{{.Names}}' | grep -q "^${DB_CONTAINER}\$"; then
     exit 1
 fi
 
-# 2. Dump Live Accounts & Characters (Characters, Gear, Bot levels/rosters, AH)
-echo "[$(date +'%Y-%m-%d %H:%M:%S')] Exporting auth and characters databases..."
+# 2. Dump Live Accounts, Characters & Web Portal (Characters, Gear, Bot rosters, AH, BlizzCMS)
+echo "[$(date +'%Y-%m-%d %H:%M:%S')] Exporting auth, characters, and blizzcms databases..."
 docker exec "${DB_CONTAINER}" mysqldump \
   -u"${DB_USER}" -p"${DB_PASS}" \
   --single-transaction --quick --routines --triggers \
-  --databases acore_auth acore_characters 2>/dev/null \
+  --databases acore_auth acore_characters blizzcms 2>/dev/null \
   | gzip -9 > "${BACKUP_DIR}/acore_live_data_${TIMESTAMP}.sql.gz"
 
 # 3. Dump World Database (includes custom bot spawns, world edits)
@@ -52,10 +52,15 @@ docker exec "${DB_CONTAINER}" mysqldump \
   acore_world 2>/dev/null \
   | gzip -9 > "${BACKUP_DIR}/acore_world_${TIMESTAMP}.sql.gz"
 
-# 4. Archive Active Module Configurations
-echo "[$(date +'%Y-%m-%d %H:%M:%S')] Archiving module configurations..."
-if [ -d "${REPO_DIR}/env/dist/etc/modules" ]; then
-    tar -czf "${BACKUP_DIR}/modules_config_${TIMESTAMP}.tar.gz" -C "${REPO_DIR}" env/dist/etc/modules/
+# 4. Archive Active Module Configurations and Web Overrides
+echo "[$(date +'%Y-%m-%d %H:%M:%S')] Archiving module & portal configurations..."
+CONFIG_ITEMS=()
+[ -d "${REPO_DIR}/env/dist/etc" ] && CONFIG_ITEMS+=("env/dist/etc")
+[ -f "${REPO_DIR}/docker-compose.override.yml" ] && CONFIG_ITEMS+=("docker-compose.override.yml")
+[ -f "${REPO_DIR}/armory/.env" ] && CONFIG_ITEMS+=("armory/.env")
+
+if [ ${#CONFIG_ITEMS[@]} -gt 0 ]; then
+    tar -czf "${BACKUP_DIR}/configs_${TIMESTAMP}.tar.gz" -C "${REPO_DIR}" "${CONFIG_ITEMS[@]}"
 fi
 
 echo "[$(date +'%Y-%m-%d %H:%M:%S')] Backup complete! Archive size: $(du -sh "${BACKUP_DIR}" | cut -f1)"
