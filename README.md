@@ -62,13 +62,20 @@ flowchart TD
 ## Repository Structure
 
 ```text
+├── config/
+│   └── bot_personalities.json        # Custom "real-gamer" bot companion personalities & backstories
 ├── docs/
 │   ├── SETUP-GUIDE.md                # End-to-end Windows + WSL 2 + Docker setup instructions
 │   ├── BOTS-AND-MODULES.md           # NPCBot commands, party management, and AutoBalance tuning
 │   ├── BOT-AND-GM-ADDONS.md          # In-game UI addons for bot control (NetherBot/nbem) and GM tools
+│   ├── PLAYERBOTS-AND-LLM-CHATTER.md # Playerbot summoning & dynamic chatter overview
+│   ├── GEMINI-CLOUD-AND-PERSONALITIES.md # Google Gemini Free-Tier & item-aware gamer personalities
 │   ├── BACKUP-AND-DISASTER-RECOVERY.md # NAS mount guide (DrvFs/fstab) and restore playbook
 │   └── WEB-PORTAL-GUIDE.md           # BlizzCMS web registration, account management & armory guide
 ├── scripts/
+│   ├── setup-gemini-cloud.ps1        # Switch chatter bridge to Google Gemini Free Tier
+│   ├── manage-bot-personalities.ps1  # Sync JSON bot backstories & tones with server database
+│   ├── manage_bot_personalities.py   # Python backend for bot personality management
 │   ├── backup.sh                     # Non-blocking live database and config backup script
 │   ├── restore.sh                    # Disaster recovery and host migration import script
 │   ├── start-server.ps1              # Starts Docker Desktop, Ollama (0.0.0.0), and core game containers
