@@ -59,14 +59,16 @@ bash scripts/backup.sh
 BACKUP_DEST="/mnt/nas_backup/acore" RETENTION_DAYS=30 bash scripts/backup.sh
 ```
 
-### Scheduling Automatic Nightly Backups (Cron)
+### Scheduling Automatic Backups (Every 4 Hours, 30-Day Retention)
 1. Open crontab in WSL:
    ```bash
    crontab -e
    ```
-2. Add a rule to execute every night at 4:00 AM:
+2. Schedule rule running every 4 hours (`00:00`, `04:00`, `08:00`, `12:00`, `16:00`, `20:00`):
    ```cron
-   0 4 * * * /bin/bash /path/to/scripts/backup.sh >> /var/log/acore_backup.log 2>&1
+   0 */4 * * * /home/chris/azerothcore-wotlk/backup-acore.sh >> /home/chris/azerothcore-wotlk/backup.log 2>&1
+   ```
+3. Snapshots older than 30 days (`RETENTION_DAYS=30`) are automatically pruned from network storage.
    ```
 
 ---

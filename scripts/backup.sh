@@ -11,7 +11,7 @@ set -eo pipefail
 BACKUP_DEST="${BACKUP_DEST:-/mnt/nas_backup}"
 TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
 BACKUP_DIR="${BACKUP_DEST}/${TIMESTAMP}"
-RETENTION_DAYS="${RETENTION_DAYS:-14}"
+RETENTION_DAYS="${RETENTION_DAYS:-30}"
 
 # Database container connection details
 DB_CONTAINER="${DB_CONTAINER:-ac-database}"
