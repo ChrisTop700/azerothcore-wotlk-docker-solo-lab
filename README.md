@@ -53,6 +53,7 @@ flowchart TD
 ├── docs/
 │   ├── SETUP-GUIDE.md                # End-to-end Windows + WSL 2 + Docker setup instructions
 │   ├── BOTS-AND-MODULES.md           # NPCBot commands, party management, and AutoBalance tuning
+│   ├── BOT-AND-GM-ADDONS.md          # In-game UI addons for bot control (NetherBot/nbem) and GM tools
 │   └── BACKUP-AND-DISASTER-RECOVERY.md # NAS mount guide (DrvFs/fstab) and restore playbook
 ├── scripts/
 │   ├── backup.sh                     # Non-blocking live database and config backup script
@@ -119,6 +120,7 @@ set realmlist 127.0.0.1
   * `.npcbot spawn <entry>` — Spawn bot.
   * Target bot and type `.npcbot add` — Add bot to party.
   * Full macro set and command syntax in [docs/BOTS-AND-MODULES.md](docs/BOTS-AND-MODULES.md).
+* **Companion & GM Addons**: Visual control via NetherBot, NpcBotEqManager, and AzerothAdmin documented in [docs/BOT-AND-GM-ADDONS.md](docs/BOT-AND-GM-ADDONS.md).
 
 ---
 
